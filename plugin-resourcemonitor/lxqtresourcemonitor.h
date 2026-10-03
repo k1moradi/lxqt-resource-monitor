@@ -20,8 +20,11 @@
 #define LXQTRESOURCEMONITOR_H
 
 #include <QColor>
+#include <QElapsedTimer>
 #include <QFont>
 #include <QFrame>
+#include <QProcess>
+#include <QByteArray>
 #include <array>
 #include <cstddef>
 
@@ -64,6 +67,9 @@ private:
         Cpu = 0,
         Memory,
         Swap,
+        Disk,
+        LocalNet,
+        Internet,
         Count
     };
 
@@ -72,10 +78,13 @@ private:
         double percent{0.0};
         quint64 usedBytes{0};
         quint64 totalBytes{0};
+        quint64 readBytesPerSecond{0};
+        quint64 writeBytesPerSecond{0};
         bool valid{false};
     };
 
-    static constexpr int DefaultWidgetWidth = 78;
+    static constexpr std::size_t ResourceCount = static_cast<std::size_t>(Resource::Count);
+    static constexpr int DefaultWidgetWidth = 57;
     static constexpr int MinimumWidgetWidth = 48;
     static constexpr int MaximumWidgetWidth = 300;
     static constexpr int DefaultUpdateIntervalMs = 1000;
@@ -87,15 +96,23 @@ private:
         return static_cast<std::size_t>(resource);
     }
 
+    [[nodiscard]] bool isResourceEnabled(Resource resource) const;
+    [[nodiscard]] int enabledResourceCount() const;
     [[nodiscard]] bool isVerticalBarOrientation() const;
-    [[nodiscard]] QRect meterRect(std::size_t resourceIndex) const;
+    [[nodiscard]] QRect meterRect(int meterIndex, int meterCount) const;
     [[nodiscard]] QRect fillRect(const QRect &meterRectangle, double percent) const;
     [[nodiscard]] QColor resourceLightColor(Resource resource) const;
     [[nodiscard]] QColor resourceDarkColor(Resource resource) const;
     [[nodiscard]] QFont fittedTextFont(const QRect &meterRectangle) const;
 
     void setSizes();
+    void configureNetworkCapture();
+    void readNetworkCaptureOutput();
     void refreshStats();
+    void updateIoSnapshot(Resource resource,
+                          quint64 readBytes,
+                          quint64 writeBytes,
+                          qint64 elapsedMilliseconds);
     void updateToolTip();
     void drawMeter(QPainter &painter, Resource resource, const QRect &meterRectangle);
 
@@ -109,6 +126,13 @@ private:
     int m_updateIntervalMs{DefaultUpdateIntervalMs};
     int m_timerId{-1};
     bool m_statgrabInitialized{false};
+    std::array<bool, ResourceCount> m_enabledResources{true, true, true, false, false, false};
+    std::array<double, 3> m_ioPeakBytesPerSecond{};
+    QProcess m_netCaptureProcess;
+    QByteArray m_netCaptureBuffer;
+    std::array<quint64, 4> m_pendingNetworkBytes{};
+    bool m_netCaptureConfigured{false};
+    QElapsedTimer m_ioSampleTimer;
 
     QFont m_font;
     QColor m_fontColor;

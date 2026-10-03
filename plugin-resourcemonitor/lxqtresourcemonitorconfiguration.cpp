@@ -16,7 +16,7 @@
 
 namespace
 {
-constexpr int DefaultWidgetWidth = 78;
+constexpr int DefaultWidgetWidth = 57;
 constexpr int DefaultUpdateIntervalMs = 1000;
 } // namespace
 
@@ -53,6 +53,30 @@ LXQtResourceMonitorConfiguration::LXQtResourceMonitorConfiguration(PluginSetting
             &QComboBox::currentIndexChanged,
             this,
             &LXQtResourceMonitorConfiguration::barOrientationChanged);
+    connect(m_ui->cpuCB, &QCheckBox::toggled, this, [this](bool enabled) {
+        if (!m_lockSettingChanges)
+            this->settings().setValue(QStringLiteral("monitorCpu"), enabled);
+    });
+    connect(m_ui->memoryCB, &QCheckBox::toggled, this, [this](bool enabled) {
+        if (!m_lockSettingChanges)
+            this->settings().setValue(QStringLiteral("monitorMemory"), enabled);
+    });
+    connect(m_ui->swapCB, &QCheckBox::toggled, this, [this](bool enabled) {
+        if (!m_lockSettingChanges)
+            this->settings().setValue(QStringLiteral("monitorSwap"), enabled);
+    });
+    connect(m_ui->diskCB, &QCheckBox::toggled, this, [this](bool enabled) {
+        if (!m_lockSettingChanges)
+            this->settings().setValue(QStringLiteral("monitorDisk"), enabled);
+    });
+    connect(m_ui->localNetCB, &QCheckBox::toggled, this, [this](bool enabled) {
+        if (!m_lockSettingChanges)
+            this->settings().setValue(QStringLiteral("monitorLocalNet"), enabled);
+    });
+    connect(m_ui->internetCB, &QCheckBox::toggled, this, [this](bool enabled) {
+        if (!m_lockSettingChanges)
+            this->settings().setValue(QStringLiteral("monitorInternet"), enabled);
+    });
 }
 
 LXQtResourceMonitorConfiguration::~LXQtResourceMonitorConfiguration()
@@ -74,6 +98,12 @@ void LXQtResourceMonitorConfiguration::loadSettings()
 
     m_ui->showTextCB->setChecked(settings().value(QStringLiteral("showText"), true).toBool());
     m_ui->widgetWidthSB->setValue(settings().value(QStringLiteral("widgetWidth"), DefaultWidgetWidth).toInt());
+    m_ui->cpuCB->setChecked(settings().value(QStringLiteral("monitorCpu"), true).toBool());
+    m_ui->memoryCB->setChecked(settings().value(QStringLiteral("monitorMemory"), true).toBool());
+    m_ui->swapCB->setChecked(settings().value(QStringLiteral("monitorSwap"), true).toBool());
+    m_ui->diskCB->setChecked(settings().value(QStringLiteral("monitorDisk"), false).toBool());
+    m_ui->localNetCB->setChecked(settings().value(QStringLiteral("monitorLocalNet"), false).toBool());
+    m_ui->internetCB->setChecked(settings().value(QStringLiteral("monitorInternet"), false).toBool());
     m_ui->updateIntervalSpinBox->setValue(
         settings().value(QStringLiteral("updateInterval"), DefaultUpdateIntervalMs).toInt() / 1000.0);
 

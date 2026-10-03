@@ -6,8 +6,8 @@
    <rect>
     <x>0</x>
     <y>0</y>
-    <width>330</width>
-    <height>225</height>
+    <width>380</width>
+    <height>410</height>
    </rect>
   </property>
   <property name="windowTitle">
@@ -15,6 +15,54 @@
   </property>
   <layout class="QGridLayout" name="gridLayout_2">
    <item row="0" column="0">
+    <widget class="QGroupBox" name="resourcesGB">
+     <property name="title">
+      <string>Resources</string>
+     </property>
+     <layout class="QGridLayout" name="resourcesLayout">
+      <item row="0" column="0">
+       <widget class="QCheckBox" name="cpuCB">
+        <property name="text"><string>CPU</string></property>
+        <property name="checked"><bool>true</bool></property>
+       </widget>
+      </item>
+      <item row="0" column="1">
+       <widget class="QCheckBox" name="memoryCB">
+        <property name="text"><string>RAM</string></property>
+        <property name="checked"><bool>true</bool></property>
+       </widget>
+      </item>
+      <item row="1" column="0">
+       <widget class="QCheckBox" name="swapCB">
+        <property name="text"><string>SWAP</string></property>
+        <property name="checked"><bool>true</bool></property>
+       </widget>
+      </item>
+      <item row="1" column="1">
+       <widget class="QCheckBox" name="diskCB">
+        <property name="text"><string>Local disk I/O</string></property>
+       </widget>
+      </item>
+      <item row="2" column="0">
+       <widget class="QCheckBox" name="localNetCB">
+        <property name="text"><string>Local net (private IP)</string></property>
+        <property name="toolTip">
+         <string>Traffic to or from private/local IP addresses. Public IP traffic is counted as Internet.</string>
+        </property>
+       </widget>
+      </item>
+      <item row="2" column="1">
+       <widget class="QCheckBox" name="internetCB">
+        <property name="text"><string>Internet I/O</string></property>
+        <property name="toolTip">
+         <string>Traffic to or from public IP addresses.</string>
+        </property>
+       </widget>
+      </item>
+     </layout>
+    </widget>
+   </item>
+   <item row="1" column="0">
     <widget class="QGroupBox" name="generalGB">
      <property name="title">
       <string>General</string>
@@ -23,7 +71,7 @@
       <item row="0" column="0" colspan="2">
        <widget class="QCheckBox" name="showTextCB">
         <property name="text">
-         <string>Show percentages</string>
+         <string>Show values</string>
         </property>
         <property name="checked">
          <bool>true</bool>
@@ -87,18 +135,24 @@
         <property name="maximum">
          <number>300</number>
         </property>
+        <property name="toolTip">
+         <string>This is the width for three resources. The widget scales with the number selected (57 px gives 19 px per resource).</string>
+        </property>
         <property name="singleStep">
          <number>1</number>
         </property>
         <property name="value">
-         <number>78</number>
+         <number>57</number>
         </property>
        </widget>
       </item>
       <item row="4" column="0" colspan="2">
        <widget class="QLabel" name="colorHintLabel">
         <property name="text">
-         <string>CPU: green   RAM: blue   SWAP: amber</string>
+         <string>CPU: green   RAM: blue   SWAP: amber   Disk: purple   Local net: teal   Internet: red</string>
+        </property>
+        <property name="wordWrap">
+         <bool>true</bool>
         </property>
         <property name="alignment">
          <set>Qt::AlignCenter</set>
@@ -108,7 +162,7 @@
      </layout>
     </widget>
    </item>
-   <item row="1" column="0">
+   <item row="2" column="0">
     <spacer name="verticalSpacer">
      <property name="orientation">
       <enum>Qt::Vertical</enum>
@@ -121,7 +175,7 @@
      </property>
     </spacer>
    </item>
-   <item row="2" column="0">
+   <item row="3" column="0">
     <widget class="QDialogButtonBox" name="buttons">
      <property name="orientation">
       <enum>Qt::Horizontal</enum>

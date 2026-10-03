@@ -2,7 +2,10 @@ diff --git a/CMakeLists.txt b/CMakeLists.txt
 index f731bfb..c1e5879 100644
 --- a/CMakeLists.txt
 +++ b/CMakeLists.txt
-@@ -103,0 +104,11 @@ endif()
+@@ -101,6 +101,17 @@ if(CPULOAD_PLUGIN)
+     add_subdirectory(plugin-cpuload)
+ endif()
+ 
 +setByDefault(RESOURCEMONITOR_PLUGIN Yes)
 +if(RESOURCEMONITOR_PLUGIN)
 +    find_library(STATGRAB_LIB statgrab)
@@ -14,12 +17,15 @@ index f731bfb..c1e5879 100644
 +    add_subdirectory(plugin-resourcemonitor)
 +endif()
 +
+ setByDefault(CUSTOMCOMMAND_PLUGIN Yes)
+ if(CUSTOMCOMMAND_PLUGIN)
+     list(APPEND ENABLED_PLUGINS "Custom Command")
 diff --git a/plugin-resourcemonitor/CMakeLists.txt b/plugin-resourcemonitor/CMakeLists.txt
 new file mode 100644
-index 0000000..9c1116c
+index 0000000..2ca7935
 --- /dev/null
 +++ b/plugin-resourcemonitor/CMakeLists.txt
-@@ -0,0 +1,23 @@
+@@ -0,0 +1,28 @@
 +set(PLUGIN "resourcemonitor")
 +
 +set(HEADERS
@@ -43,12 +49,17 @@ index 0000000..9c1116c
 +set(LIBRARIES ${STATGRAB_LIB})
 +
 +BUILD_LXQT_PLUGIN(${PLUGIN})
++
++add_executable(resourcemonitor-netcap resourcemonitor-netcap.cpp)
++target_compile_features(resourcemonitor-netcap PRIVATE cxx_std_17)
++target_compile_options(resourcemonitor-netcap PRIVATE -Wall -Wextra -Wpedantic)
++install(TARGETS resourcemonitor-netcap RUNTIME DESTINATION bin)
 diff --git a/plugin-resourcemonitor/lxqtresourcemonitor.cpp b/plugin-resourcemonitor/lxqtresourcemonitor.cpp
 new file mode 100644
-index 0000000..0fb2c1b
+index 0000000..8e4b5a9
 --- /dev/null
 +++ b/plugin-resourcemonitor/lxqtresourcemonitor.cpp
-@@ -0,0 +1,468 @@
+@@ -0,0 +1,749 @@
 +/* BEGIN_COMMON_COPYRIGHT_HEADER
 + * (c)LGPL2+
 + *
@@ -79,11 +90,13 @@ index 0000000..0fb2c1b
 +#include <QLinearGradient>
 +#include <QPainter>
 +#include <QPalette>
++#include <QStandardPaths>
 +#include <QStringList>
 +#include <QTimerEvent>
 +
 +#include <algorithm>
 +#include <cmath>
++#include <limits>
 +
 +extern "C" {
 +#include <statgrab.h>
@@ -100,11 +113,10 @@ index 0000000..0fb2c1b
 +constexpr auto BarOrientLeftRight = "leftRight";
 +constexpr auto BarOrientRightLeft = "rightLeft";
 +
-+constexpr int MeterCount = 3;
-+constexpr int OuterMargin = 1;
-+constexpr int MeterGap = 1;
++constexpr int OuterMargin = 0;
++constexpr int MeterGap = 0;
 +constexpr int MeterInnerMargin = 1;
-+constexpr int TextHorizontalPadding = 1;
++constexpr int TextHorizontalPadding = 0;
 +constexpr int PreferredTextPixelSize = 10;
 +constexpr int MinimumTextPixelSize = 7;
 +
@@ -140,6 +152,28 @@ index 0000000..0fb2c1b
 +    // Keep the text compact, like the existing CPU Monitor. Pixel sizing is
 +    // predictable on narrow panel widgets and is reduced further when needed.
 +    m_font.setPixelSize(PreferredTextPixelSize);
++    m_ioSampleTimer.start();
++
++    connect(&m_netCaptureProcess, &QProcess::readyReadStandardOutput,
++            this, &LXQtResourceMonitor::readNetworkCaptureOutput);
++    connect(&m_netCaptureProcess, &QProcess::readyReadStandardError, this, [this]() {
++        const QByteArray errorOutput = m_netCaptureProcess.readAllStandardError().trimmed();
++        if (!errorOutput.isEmpty())
++            qWarning().noquote() << "Resource Monitor network capture:" << QString::fromLocal8Bit(errorOutput);
++    });
++    connect(&m_netCaptureProcess, &QProcess::errorOccurred, this, [this](QProcess::ProcessError error) {
++        if (error == QProcess::FailedToStart)
++            m_netCaptureConfigured = false;
++        updateToolTip();
++    });
++    connect(&m_netCaptureProcess,
++            qOverload<int, QProcess::ExitStatus>(&QProcess::finished),
++            this,
++            [this](int, QProcess::ExitStatus) {
++                m_pendingNetworkBytes = {};
++                updateToolTip();
++                update();
++            });
 +
 +    settingsChanged();
 +    refreshStats();
@@ -150,6 +184,16 @@ index 0000000..0fb2c1b
 +    if (m_timerId != -1)
 +        killTimer(m_timerId);
 +
++    if (m_netCaptureProcess.state() != QProcess::NotRunning)
++    {
++        m_netCaptureProcess.terminate();
++        if (!m_netCaptureProcess.waitForFinished(250))
++        {
++            m_netCaptureProcess.kill();
++            m_netCaptureProcess.waitForFinished(250);
++        }
++    }
++
 +    if (m_statgrabInitialized)
 +        sg_shutdown();
 +}
@@ -159,11 +203,22 @@ index 0000000..0fb2c1b
 +    return m_barOrientation == BottomUpBar || m_barOrientation == TopDownBar;
 +}
 +
++bool LXQtResourceMonitor::isResourceEnabled(Resource resource) const
++{
++    return m_enabledResources[resourceIndex(resource)];
++}
++
++int LXQtResourceMonitor::enabledResourceCount() const
++{
++    return static_cast<int>(std::count(m_enabledResources.cbegin(), m_enabledResources.cend(), true));
++}
++
 +void LXQtResourceMonitor::setSizes()
 +{
-+    // Width is the user-facing footprint of the complete three-meter widget.
-+    // Height is controlled by the panel.
-+    m_sizingWidget.setFixedWidth(m_widgetWidth);
++    // The width setting describes the default three-resource layout. Keep the
++    // same per-resource width as optional meters are enabled or disabled.
++    const int resourceCount = enabledResourceCount();
++    m_sizingWidget.setFixedWidth(m_widgetWidth * resourceCount / 3);
 +    m_sizingWidget.setMinimumHeight(24);
 +}
 +
@@ -174,38 +229,38 @@ index 0000000..0fb2c1b
 +    update();
 +}
 +
-+QRect LXQtResourceMonitor::meterRect(std::size_t resourceIndexValue) const
++QRect LXQtResourceMonitor::meterRect(int meterIndex, int meterCount) const
 +{
 +    const QRect availableRectangle = rect().adjusted(OuterMargin,
 +                                                      OuterMargin,
 +                                                      -OuterMargin,
 +                                                      -OuterMargin);
-+    if (availableRectangle.isEmpty() || resourceIndexValue >= static_cast<std::size_t>(MeterCount))
++    if (availableRectangle.isEmpty() || meterCount <= 0 || meterIndex < 0 || meterIndex >= meterCount)
 +        return {};
 +
 +    if (isVerticalBarOrientation())
 +    {
-+        const int usableWidth = std::max(0, availableRectangle.width() - MeterGap * (MeterCount - 1));
-+        const int baseWidth = usableWidth / MeterCount;
-+        const int remainder = usableWidth % MeterCount;
++        const int usableWidth = std::max(0, availableRectangle.width() - MeterGap * (meterCount - 1));
++        const int baseWidth = usableWidth / meterCount;
++        const int remainder = usableWidth % meterCount;
 +
 +        int x = availableRectangle.left();
-+        for (std::size_t index = 0; index < resourceIndexValue; ++index)
-+            x += baseWidth + (static_cast<int>(index) < remainder ? 1 : 0) + MeterGap;
++        for (int index = 0; index < meterIndex; ++index)
++            x += baseWidth + (index < remainder ? 1 : 0) + MeterGap;
 +
-+        const int width = baseWidth + (static_cast<int>(resourceIndexValue) < remainder ? 1 : 0);
++        const int width = baseWidth + (meterIndex < remainder ? 1 : 0);
 +        return QRect(x, availableRectangle.top(), width, availableRectangle.height());
 +    }
 +
-+    const int usableHeight = std::max(0, availableRectangle.height() - MeterGap * (MeterCount - 1));
-+    const int baseHeight = usableHeight / MeterCount;
-+    const int remainder = usableHeight % MeterCount;
++    const int usableHeight = std::max(0, availableRectangle.height() - MeterGap * (meterCount - 1));
++    const int baseHeight = usableHeight / meterCount;
++    const int remainder = usableHeight % meterCount;
 +
 +    int y = availableRectangle.top();
-+    for (std::size_t index = 0; index < resourceIndexValue; ++index)
-+        y += baseHeight + (static_cast<int>(index) < remainder ? 1 : 0) + MeterGap;
++    for (int index = 0; index < meterIndex; ++index)
++        y += baseHeight + (index < remainder ? 1 : 0) + MeterGap;
 +
-+    const int height = baseHeight + (static_cast<int>(resourceIndexValue) < remainder ? 1 : 0);
++    const int height = baseHeight + (meterIndex < remainder ? 1 : 0);
 +    return QRect(availableRectangle.left(), y, availableRectangle.width(), height);
 +}
 +
@@ -268,6 +323,12 @@ index 0000000..0fb2c1b
 +        return QColor(48, 156, 255, 170);    // Blue: physical memory.
 +    case Resource::Swap:
 +        return QColor(255, 181, 32, 180);    // Amber: swap.
++    case Resource::Disk:
++        return QColor(200, 112, 224, 190);  // Purple: local disk I/O.
++    case Resource::LocalNet:
++        return QColor(32, 196, 176, 190);   // Teal: local network I/O.
++    case Resource::Internet:
++        return QColor(255, 96, 96, 190);    // Red: Internet I/O.
 +    case Resource::Count:
 +        break;
 +    }
@@ -284,6 +345,12 @@ index 0000000..0fb2c1b
 +        return QColor(0, 92, 184, 255);
 +    case Resource::Swap:
 +        return QColor(196, 112, 0, 255);
++    case Resource::Disk:
++        return QColor(112, 48, 144, 255);
++    case Resource::LocalNet:
++        return QColor(0, 112, 96, 255);
++    case Resource::Internet:
++        return QColor(176, 32, 32, 255);
 +    case Resource::Count:
 +        break;
 +    }
@@ -319,7 +386,7 @@ index 0000000..0fb2c1b
 +    const QColor lightColor = resourceLightColor(resource);
 +    const QColor darkColor = resourceDarkColor(resource);
 +
-+    // A resource-colored outline remains visible even at 0%, so CPU/RAM/SWAP
++    // A resource-colored outline remains visible even at 0%, so resources
 +    // are distinguishable without spending panel width on text labels.
 +    QColor outlineColor = darkColor;
 +    outlineColor.setAlpha(150);
@@ -362,9 +429,18 @@ index 0000000..0fb2c1b
 +    QPainter painter(this);
 +    painter.setRenderHint(QPainter::Antialiasing, false);
 +
-+    drawMeter(painter, Resource::Cpu, meterRect(resourceIndex(Resource::Cpu)));
-+    drawMeter(painter, Resource::Memory, meterRect(resourceIndex(Resource::Memory)));
-+    drawMeter(painter, Resource::Swap, meterRect(resourceIndex(Resource::Swap)));
++    const int meterCount = enabledResourceCount();
++    int meterIndex = 0;
++    for (std::size_t index = 0; index < ResourceCount; ++index)
++    {
++        if (!m_enabledResources[index])
++            continue;
++
++        drawMeter(painter,
++                  static_cast<Resource>(index),
++                  meterRect(meterIndex, meterCount));
++        ++meterIndex;
++    }
 +}
 +
 +void LXQtResourceMonitor::refreshStats()
@@ -372,66 +448,232 @@ index 0000000..0fb2c1b
 +    auto &cpuSnapshot = m_resources[resourceIndex(Resource::Cpu)];
 +    auto &memorySnapshot = m_resources[resourceIndex(Resource::Memory)];
 +    auto &swapSnapshot = m_resources[resourceIndex(Resource::Swap)];
++    const qint64 elapsedMilliseconds = std::max<qint64>(1, m_ioSampleTimer.restart());
 +
 +    if (!m_statgrabInitialized)
 +    {
-+        cpuSnapshot.valid = false;
-+        memorySnapshot.valid = false;
-+        swapSnapshot.valid = false;
-+        updateToolTip();
-+        update();
-+        return;
-+    }
-+
-+    const ResourceMonitorMath::CpuUsageSample cpuUsage =
-+        ResourceMonitorMath::sampleCpuUsage();
-+    cpuSnapshot.valid = cpuUsage.valid;
-+    cpuSnapshot.percent = cpuUsage.percent;
-+
-+#ifdef STATGRAB_NEWER_THAN_0_90
-+    size_t memoryCount = 0;
-+    const sg_mem_stats *memoryStats = sg_get_mem_stats(&memoryCount);
-+    memorySnapshot.valid = memoryStats != nullptr && memoryCount > 0;
-+#else
-+    const sg_mem_stats *memoryStats = sg_get_mem_stats();
-+    memorySnapshot.valid = memoryStats != nullptr;
-+#endif
-+    if (memorySnapshot.valid)
-+    {
-+        memorySnapshot.usedBytes = static_cast<quint64>(memoryStats->used);
-+        memorySnapshot.totalBytes = static_cast<quint64>(memoryStats->total);
-+        memorySnapshot.percent = ResourceMonitorMath::calculatePercent(memorySnapshot.usedBytes, memorySnapshot.totalBytes);
++        for (auto &snapshot : m_resources)
++            snapshot.valid = false;
 +    }
 +    else
 +    {
-+        memorySnapshot.percent = 0.0;
-+        memorySnapshot.usedBytes = 0;
-+        memorySnapshot.totalBytes = 0;
-+    }
++        const ResourceMonitorMath::CpuUsageSample cpuUsage =
++            ResourceMonitorMath::sampleCpuUsage();
++        cpuSnapshot.valid = cpuUsage.valid;
++        cpuSnapshot.percent = cpuUsage.percent;
 +
 +#ifdef STATGRAB_NEWER_THAN_0_90
-+    size_t swapCount = 0;
-+    const sg_swap_stats *swapStats = sg_get_swap_stats(&swapCount);
-+    swapSnapshot.valid = swapStats != nullptr && swapCount > 0;
++        size_t memoryCount = 0;
++        const sg_mem_stats *memoryStats = sg_get_mem_stats(&memoryCount);
++        memorySnapshot.valid = memoryStats != nullptr && memoryCount > 0;
 +#else
-+    const sg_swap_stats *swapStats = sg_get_swap_stats();
-+    swapSnapshot.valid = swapStats != nullptr;
++        const sg_mem_stats *memoryStats = sg_get_mem_stats();
++        memorySnapshot.valid = memoryStats != nullptr;
 +#endif
-+    if (swapSnapshot.valid)
++        if (memorySnapshot.valid)
++        {
++            memorySnapshot.usedBytes = static_cast<quint64>(memoryStats->used);
++            memorySnapshot.totalBytes = static_cast<quint64>(memoryStats->total);
++            memorySnapshot.percent = ResourceMonitorMath::calculatePercent(memorySnapshot.usedBytes, memorySnapshot.totalBytes);
++        }
++        else
++        {
++            memorySnapshot.percent = 0.0;
++            memorySnapshot.usedBytes = 0;
++            memorySnapshot.totalBytes = 0;
++        }
++
++#ifdef STATGRAB_NEWER_THAN_0_90
++        size_t swapCount = 0;
++        const sg_swap_stats *swapStats = sg_get_swap_stats(&swapCount);
++        swapSnapshot.valid = swapStats != nullptr && swapCount > 0;
++#else
++        const sg_swap_stats *swapStats = sg_get_swap_stats();
++        swapSnapshot.valid = swapStats != nullptr;
++#endif
++        if (swapSnapshot.valid)
++        {
++            swapSnapshot.usedBytes = static_cast<quint64>(swapStats->used);
++            swapSnapshot.totalBytes = static_cast<quint64>(swapStats->total);
++            swapSnapshot.percent = ResourceMonitorMath::calculatePercent(swapSnapshot.usedBytes, swapSnapshot.totalBytes);
++        }
++        else
++        {
++            swapSnapshot.percent = 0.0;
++            swapSnapshot.usedBytes = 0;
++            swapSnapshot.totalBytes = 0;
++        }
++
++        auto &diskSnapshot = m_resources[resourceIndex(Resource::Disk)];
++#ifdef STATGRAB_NEWER_THAN_0_90
++        size_t diskCount = 0;
++        const sg_disk_io_stats *diskStats = sg_get_disk_io_stats_diff(&diskCount);
++#else
++        const sg_disk_io_stats *diskStats = sg_get_disk_io_stats_diff();
++        const size_t diskCount = diskStats != nullptr ? 1 : 0;
++#endif
++        if (diskStats != nullptr && diskCount > 0)
++        {
++            quint64 readBytes = 0;
++            quint64 writeBytes = 0;
++            for (size_t index = 0; index < diskCount; ++index)
++            {
++                readBytes += diskStats[index].read_bytes;
++                writeBytes += diskStats[index].write_bytes;
++            }
++            updateIoSnapshot(Resource::Disk, readBytes, writeBytes, elapsedMilliseconds);
++        }
++        else
++        {
++            diskSnapshot.valid = false;
++        }
++    }
++
++    readNetworkCaptureOutput();
++    const bool networkCaptureRunning = m_netCaptureConfigured
++        && m_netCaptureProcess.state() == QProcess::Running;
++    if (networkCaptureRunning)
 +    {
-+        swapSnapshot.usedBytes = static_cast<quint64>(swapStats->used);
-+        swapSnapshot.totalBytes = static_cast<quint64>(swapStats->total);
-+        swapSnapshot.percent = ResourceMonitorMath::calculatePercent(swapSnapshot.usedBytes, swapSnapshot.totalBytes);
++        updateIoSnapshot(Resource::LocalNet,
++                         m_pendingNetworkBytes[0],
++                         m_pendingNetworkBytes[1],
++                         elapsedMilliseconds);
++        updateIoSnapshot(Resource::Internet,
++                         m_pendingNetworkBytes[2],
++                         m_pendingNetworkBytes[3],
++                         elapsedMilliseconds);
 +    }
 +    else
 +    {
-+        swapSnapshot.percent = 0.0;
-+        swapSnapshot.usedBytes = 0;
-+        swapSnapshot.totalBytes = 0;
++        m_resources[resourceIndex(Resource::LocalNet)].valid = false;
++        m_resources[resourceIndex(Resource::Internet)].valid = false;
 +    }
++    m_pendingNetworkBytes = {};
 +
 +    updateToolTip();
 +    update();
++}
++
++void LXQtResourceMonitor::configureNetworkCapture()
++{
++    const bool networkMonitoringEnabled = isResourceEnabled(Resource::LocalNet)
++        || isResourceEnabled(Resource::Internet);
++
++    if (!networkMonitoringEnabled)
++    {
++        m_netCaptureConfigured = false;
++        m_pendingNetworkBytes = {};
++        m_netCaptureBuffer.clear();
++        m_resources[resourceIndex(Resource::LocalNet)].valid = false;
++        m_resources[resourceIndex(Resource::Internet)].valid = false;
++        if (m_netCaptureProcess.state() != QProcess::NotRunning)
++        {
++            m_netCaptureProcess.terminate();
++            if (!m_netCaptureProcess.waitForFinished(250))
++            {
++                m_netCaptureProcess.kill();
++                m_netCaptureProcess.waitForFinished(250);
++            }
++        }
++        return;
++    }
++
++    if (m_netCaptureProcess.state() != QProcess::NotRunning)
++        return;
++
++    const QString executable = QStandardPaths::findExecutable(QStringLiteral("resourcemonitor-netcap"));
++    if (executable.isEmpty())
++    {
++        m_netCaptureConfigured = false;
++        return;
++    }
++
++    m_netCaptureConfigured = true;
++    m_pendingNetworkBytes = {};
++    m_netCaptureBuffer.clear();
++    m_netCaptureProcess.start(executable, QStringList{}, QIODevice::ReadOnly);
++}
++
++void LXQtResourceMonitor::readNetworkCaptureOutput()
++{
++    if (m_netCaptureProcess.state() == QProcess::NotRunning)
++        return;
++
++    m_netCaptureBuffer.append(m_netCaptureProcess.readAllStandardOutput());
++    constexpr qsizetype MaximumBufferedBytes = 4096;
++    if (m_netCaptureBuffer.size() > MaximumBufferedBytes)
++    {
++        m_netCaptureBuffer.clear();
++        m_pendingNetworkBytes = {};
++        return;
++    }
++
++    while (true)
++    {
++        const qsizetype newline = m_netCaptureBuffer.indexOf('\n');
++        if (newline < 0)
++            break;
++
++        const QList<QByteArray> fields = m_netCaptureBuffer.left(newline).simplified().split(' ');
++        m_netCaptureBuffer.remove(0, newline + 1);
++        if (fields.size() != 4)
++            continue;
++
++        std::array<quint64, 4> counters{};
++        bool validLine = true;
++        for (std::size_t index = 0; index < counters.size(); ++index)
++        {
++            bool ok = false;
++            counters[index] = fields[static_cast<qsizetype>(index)].toULongLong(&ok);
++            validLine = validLine && ok;
++        }
++        if (!validLine)
++            continue;
++
++        for (std::size_t index = 0; index < counters.size(); ++index)
++        {
++            const quint64 remaining = std::numeric_limits<quint64>::max() - m_pendingNetworkBytes[index];
++            m_pendingNetworkBytes[index] += std::min(counters[index], remaining);
++        }
++    }
++}
++
++void LXQtResourceMonitor::updateIoSnapshot(Resource resource,
++                                           quint64 readBytes,
++                                           quint64 writeBytes,
++                                           qint64 elapsedMilliseconds)
++{
++    std::size_t peakIndex = 0;
++    switch (resource)
++    {
++    case Resource::Disk:
++        peakIndex = 0;
++        break;
++    case Resource::LocalNet:
++        peakIndex = 1;
++        break;
++    case Resource::Internet:
++        peakIndex = 2;
++        break;
++    default:
++        return;
++    }
++
++    ResourceSnapshot &snapshot = m_resources[resourceIndex(resource)];
++    const double intervalSeconds = static_cast<double>(std::max<qint64>(1, elapsedMilliseconds)) / 1000.0;
++    const double readRate = static_cast<double>(readBytes) / intervalSeconds;
++    const double writeRate = static_cast<double>(writeBytes) / intervalSeconds;
++    const double totalRate = readRate + writeRate;
++
++    snapshot.readBytesPerSecond = static_cast<quint64>(std::llround(readRate));
++    snapshot.writeBytesPerSecond = static_cast<quint64>(std::llround(writeRate));
++    snapshot.valid = true;
++
++    double &peakRate = m_ioPeakBytesPerSecond[peakIndex];
++    peakRate = std::max(totalRate, peakRate * 0.9);
++    snapshot.percent = peakRate > 0.0
++        ? std::clamp(totalRate * 100.0 / peakRate, 0.0, 100.0)
++        : 0.0;
 +}
 +
 +void LXQtResourceMonitor::updateToolTip()
@@ -439,36 +681,73 @@ index 0000000..0fb2c1b
 +    const ResourceSnapshot &cpuSnapshot = m_resources[resourceIndex(Resource::Cpu)];
 +    const ResourceSnapshot &memorySnapshot = m_resources[resourceIndex(Resource::Memory)];
 +    const ResourceSnapshot &swapSnapshot = m_resources[resourceIndex(Resource::Swap)];
++    const ResourceSnapshot &diskSnapshot = m_resources[resourceIndex(Resource::Disk)];
++    const ResourceSnapshot &localNetSnapshot = m_resources[resourceIndex(Resource::LocalNet)];
++    const ResourceSnapshot &internetSnapshot = m_resources[resourceIndex(Resource::Internet)];
 +
 +    QStringList lines;
-+    lines.reserve(3);
++    lines.reserve(enabledResourceCount());
 +
-+    lines.emplaceBack(cpuSnapshot.valid
-+        ? tr("CPU: %1%").arg(qRound(cpuSnapshot.percent))
-+        : tr("CPU: unavailable"));
++    if (isResourceEnabled(Resource::Cpu))
++    {
++        lines.emplaceBack(cpuSnapshot.valid
++            ? tr("CPU: %1%").arg(qRound(cpuSnapshot.percent))
++            : tr("CPU: unavailable"));
++    }
 +
-+    lines.emplaceBack(memorySnapshot.valid
-+        ? tr("RAM: %1% — %2 / %3")
-+              .arg(qRound(memorySnapshot.percent))
-+              .arg(ResourceMonitorMath::formatBytes(memorySnapshot.usedBytes))
-+              .arg(ResourceMonitorMath::formatBytes(memorySnapshot.totalBytes))
-+        : tr("RAM: unavailable"));
++    if (isResourceEnabled(Resource::Memory))
++    {
++        lines.emplaceBack(memorySnapshot.valid
++            ? tr("RAM: %1% — %2 / %3")
++                  .arg(qRound(memorySnapshot.percent))
++                  .arg(ResourceMonitorMath::formatBytes(memorySnapshot.usedBytes))
++                  .arg(ResourceMonitorMath::formatBytes(memorySnapshot.totalBytes))
++            : tr("RAM: unavailable"));
++    }
 +
-+    if (!swapSnapshot.valid)
++    if (isResourceEnabled(Resource::Swap))
 +    {
-+        lines.emplaceBack(tr("SWAP: unavailable"));
++        if (!swapSnapshot.valid)
++            lines.emplaceBack(tr("SWAP: unavailable"));
++        else if (swapSnapshot.totalBytes == 0)
++            lines.emplaceBack(tr("SWAP: not configured"));
++        else
++            lines.emplaceBack(tr("SWAP: %1% — %2 / %3")
++                                  .arg(qRound(swapSnapshot.percent))
++                                  .arg(ResourceMonitorMath::formatBytes(swapSnapshot.usedBytes))
++                                  .arg(ResourceMonitorMath::formatBytes(swapSnapshot.totalBytes)));
 +    }
-+    else if (swapSnapshot.totalBytes == 0)
++
++    const auto formatIoRate = [](quint64 bytesPerSecond) {
++        return ResourceMonitorMath::formatBytes(bytesPerSecond) + QStringLiteral("/s");
++    };
++    if (isResourceEnabled(Resource::Disk))
 +    {
-+        lines.emplaceBack(tr("SWAP: not configured"));
++        lines.emplaceBack(diskSnapshot.valid
++            ? tr("Local disk I/O: read %1, write %2")
++                  .arg(formatIoRate(diskSnapshot.readBytesPerSecond))
++                  .arg(formatIoRate(diskSnapshot.writeBytesPerSecond))
++            : tr("Local disk I/O: unavailable"));
 +    }
-+    else
++    if (isResourceEnabled(Resource::LocalNet))
 +    {
-+        lines.emplaceBack(tr("SWAP: %1% — %2 / %3")
-+                              .arg(qRound(swapSnapshot.percent))
-+                              .arg(ResourceMonitorMath::formatBytes(swapSnapshot.usedBytes))
-+                              .arg(ResourceMonitorMath::formatBytes(swapSnapshot.totalBytes)));
++        lines.emplaceBack(localNetSnapshot.valid
++            ? tr("Local network I/O: receive %1, transmit %2")
++                  .arg(formatIoRate(localNetSnapshot.readBytesPerSecond))
++                  .arg(formatIoRate(localNetSnapshot.writeBytesPerSecond))
++            : tr("Local network I/O: unavailable (capture helper with CAP_NET_RAW required)"));
 +    }
++    if (isResourceEnabled(Resource::Internet))
++    {
++        lines.emplaceBack(internetSnapshot.valid
++            ? tr("Internet I/O: receive %1, transmit %2")
++                  .arg(formatIoRate(internetSnapshot.readBytesPerSecond))
++                  .arg(formatIoRate(internetSnapshot.writeBytesPerSecond))
++            : tr("Internet I/O: unavailable (capture helper with CAP_NET_RAW required)"));
++    }
++
++    if (lines.isEmpty())
++        lines.emplaceBack(tr("No resources selected"));
 +
 +    setToolTip(lines.join(QLatin1Char('\n')));
 +}
@@ -496,6 +775,18 @@ index 0000000..0fb2c1b
 +    m_widgetWidth = std::clamp(m_plugin->settings()->value(QStringLiteral("widgetWidth"), DefaultWidgetWidth).toInt(),
 +                               MinimumWidgetWidth,
 +                               MaximumWidgetWidth);
++    m_enabledResources[resourceIndex(Resource::Cpu)] =
++        m_plugin->settings()->value(QStringLiteral("monitorCpu"), true).toBool();
++    m_enabledResources[resourceIndex(Resource::Memory)] =
++        m_plugin->settings()->value(QStringLiteral("monitorMemory"), true).toBool();
++    m_enabledResources[resourceIndex(Resource::Swap)] =
++        m_plugin->settings()->value(QStringLiteral("monitorSwap"), true).toBool();
++    m_enabledResources[resourceIndex(Resource::Disk)] =
++        m_plugin->settings()->value(QStringLiteral("monitorDisk"), false).toBool();
++    m_enabledResources[resourceIndex(Resource::LocalNet)] =
++        m_plugin->settings()->value(QStringLiteral("monitorLocalNet"), false).toBool();
++    m_enabledResources[resourceIndex(Resource::Internet)] =
++        m_plugin->settings()->value(QStringLiteral("monitorInternet"), false).toBool();
 +    m_updateIntervalMs = std::clamp(m_plugin->settings()->value(QStringLiteral("updateInterval"), DefaultUpdateIntervalMs).toInt(),
 +                                    MinimumUpdateIntervalMs,
 +                                    MaximumUpdateIntervalMs);
@@ -513,16 +804,17 @@ index 0000000..0fb2c1b
 +    else
 +        m_barOrientation = BottomUpBar;
 +
++    configureNetworkCapture();
 +    m_timerId = startTimer(m_updateIntervalMs);
 +    setSizes();
 +    update();
 +}
 diff --git a/plugin-resourcemonitor/lxqtresourcemonitor.h b/plugin-resourcemonitor/lxqtresourcemonitor.h
 new file mode 100644
-index 0000000..f0395a2
+index 0000000..d49ab60
 --- /dev/null
 +++ b/plugin-resourcemonitor/lxqtresourcemonitor.h
-@@ -0,0 +1,117 @@
+@@ -0,0 +1,141 @@
 +/* BEGIN_COMMON_COPYRIGHT_HEADER
 + * (c)LGPL2+
 + *
@@ -545,8 +837,11 @@ index 0000000..f0395a2
 +#define LXQTRESOURCEMONITOR_H
 +
 +#include <QColor>
++#include <QElapsedTimer>
 +#include <QFont>
 +#include <QFrame>
++#include <QProcess>
++#include <QByteArray>
 +#include <array>
 +#include <cstddef>
 +
@@ -589,6 +884,9 @@ index 0000000..f0395a2
 +        Cpu = 0,
 +        Memory,
 +        Swap,
++        Disk,
++        LocalNet,
++        Internet,
 +        Count
 +    };
 +
@@ -597,10 +895,13 @@ index 0000000..f0395a2
 +        double percent{0.0};
 +        quint64 usedBytes{0};
 +        quint64 totalBytes{0};
++        quint64 readBytesPerSecond{0};
++        quint64 writeBytesPerSecond{0};
 +        bool valid{false};
 +    };
 +
-+    static constexpr int DefaultWidgetWidth = 78;
++    static constexpr std::size_t ResourceCount = static_cast<std::size_t>(Resource::Count);
++    static constexpr int DefaultWidgetWidth = 57;
 +    static constexpr int MinimumWidgetWidth = 48;
 +    static constexpr int MaximumWidgetWidth = 300;
 +    static constexpr int DefaultUpdateIntervalMs = 1000;
@@ -612,15 +913,23 @@ index 0000000..f0395a2
 +        return static_cast<std::size_t>(resource);
 +    }
 +
++    [[nodiscard]] bool isResourceEnabled(Resource resource) const;
++    [[nodiscard]] int enabledResourceCount() const;
 +    [[nodiscard]] bool isVerticalBarOrientation() const;
-+    [[nodiscard]] QRect meterRect(std::size_t resourceIndex) const;
++    [[nodiscard]] QRect meterRect(int meterIndex, int meterCount) const;
 +    [[nodiscard]] QRect fillRect(const QRect &meterRectangle, double percent) const;
 +    [[nodiscard]] QColor resourceLightColor(Resource resource) const;
 +    [[nodiscard]] QColor resourceDarkColor(Resource resource) const;
 +    [[nodiscard]] QFont fittedTextFont(const QRect &meterRectangle) const;
 +
 +    void setSizes();
++    void configureNetworkCapture();
++    void readNetworkCaptureOutput();
 +    void refreshStats();
++    void updateIoSnapshot(Resource resource,
++                          quint64 readBytes,
++                          quint64 writeBytes,
++                          qint64 elapsedMilliseconds);
 +    void updateToolTip();
 +    void drawMeter(QPainter &painter, Resource resource, const QRect &meterRectangle);
 +
@@ -634,6 +943,13 @@ index 0000000..f0395a2
 +    int m_updateIntervalMs{DefaultUpdateIntervalMs};
 +    int m_timerId{-1};
 +    bool m_statgrabInitialized{false};
++    std::array<bool, ResourceCount> m_enabledResources{true, true, true, false, false, false};
++    std::array<double, 3> m_ioPeakBytesPerSecond{};
++    QProcess m_netCaptureProcess;
++    QByteArray m_netCaptureBuffer;
++    std::array<quint64, 4> m_pendingNetworkBytes{};
++    bool m_netCaptureConfigured{false};
++    QElapsedTimer m_ioSampleTimer;
 +
 +    QFont m_font;
 +    QColor m_fontColor;
@@ -642,10 +958,10 @@ index 0000000..f0395a2
 +#endif // LXQTRESOURCEMONITOR_H
 diff --git a/plugin-resourcemonitor/lxqtresourcemonitorconfiguration.cpp b/plugin-resourcemonitor/lxqtresourcemonitorconfiguration.cpp
 new file mode 100644
-index 0000000..f228b15
+index 0000000..9ebf638
 --- /dev/null
 +++ b/plugin-resourcemonitor/lxqtresourcemonitorconfiguration.cpp
-@@ -0,0 +1,114 @@
+@@ -0,0 +1,144 @@
 +/* BEGIN_COMMON_COPYRIGHT_HEADER
 + * (c)LGPL2+
 + *
@@ -664,7 +980,7 @@ index 0000000..f228b15
 +
 +namespace
 +{
-+constexpr int DefaultWidgetWidth = 78;
++constexpr int DefaultWidgetWidth = 57;
 +constexpr int DefaultUpdateIntervalMs = 1000;
 +} // namespace
 +
@@ -701,6 +1017,30 @@ index 0000000..f228b15
 +            &QComboBox::currentIndexChanged,
 +            this,
 +            &LXQtResourceMonitorConfiguration::barOrientationChanged);
++    connect(m_ui->cpuCB, &QCheckBox::toggled, this, [this](bool enabled) {
++        if (!m_lockSettingChanges)
++            this->settings().setValue(QStringLiteral("monitorCpu"), enabled);
++    });
++    connect(m_ui->memoryCB, &QCheckBox::toggled, this, [this](bool enabled) {
++        if (!m_lockSettingChanges)
++            this->settings().setValue(QStringLiteral("monitorMemory"), enabled);
++    });
++    connect(m_ui->swapCB, &QCheckBox::toggled, this, [this](bool enabled) {
++        if (!m_lockSettingChanges)
++            this->settings().setValue(QStringLiteral("monitorSwap"), enabled);
++    });
++    connect(m_ui->diskCB, &QCheckBox::toggled, this, [this](bool enabled) {
++        if (!m_lockSettingChanges)
++            this->settings().setValue(QStringLiteral("monitorDisk"), enabled);
++    });
++    connect(m_ui->localNetCB, &QCheckBox::toggled, this, [this](bool enabled) {
++        if (!m_lockSettingChanges)
++            this->settings().setValue(QStringLiteral("monitorLocalNet"), enabled);
++    });
++    connect(m_ui->internetCB, &QCheckBox::toggled, this, [this](bool enabled) {
++        if (!m_lockSettingChanges)
++            this->settings().setValue(QStringLiteral("monitorInternet"), enabled);
++    });
 +}
 +
 +LXQtResourceMonitorConfiguration::~LXQtResourceMonitorConfiguration()
@@ -722,6 +1062,12 @@ index 0000000..f228b15
 +
 +    m_ui->showTextCB->setChecked(settings().value(QStringLiteral("showText"), true).toBool());
 +    m_ui->widgetWidthSB->setValue(settings().value(QStringLiteral("widgetWidth"), DefaultWidgetWidth).toInt());
++    m_ui->cpuCB->setChecked(settings().value(QStringLiteral("monitorCpu"), true).toBool());
++    m_ui->memoryCB->setChecked(settings().value(QStringLiteral("monitorMemory"), true).toBool());
++    m_ui->swapCB->setChecked(settings().value(QStringLiteral("monitorSwap"), true).toBool());
++    m_ui->diskCB->setChecked(settings().value(QStringLiteral("monitorDisk"), false).toBool());
++    m_ui->localNetCB->setChecked(settings().value(QStringLiteral("monitorLocalNet"), false).toBool());
++    m_ui->internetCB->setChecked(settings().value(QStringLiteral("monitorInternet"), false).toBool());
 +    m_ui->updateIntervalSpinBox->setValue(
 +        settings().value(QStringLiteral("updateInterval"), DefaultUpdateIntervalMs).toInt() / 1000.0);
 +
@@ -815,10 +1161,10 @@ index 0000000..3e15adf
 +#endif // LXQTRESOURCEMONITORCONFIGURATION_H
 diff --git a/plugin-resourcemonitor/lxqtresourcemonitorconfiguration.ui b/plugin-resourcemonitor/lxqtresourcemonitorconfiguration.ui
 new file mode 100644
-index 0000000..6aaf553
+index 0000000..13def70
 --- /dev/null
 +++ b/plugin-resourcemonitor/lxqtresourcemonitorconfiguration.ui
-@@ -0,0 +1,138 @@
+@@ -0,0 +1,192 @@
 +<?xml version="1.0" encoding="UTF-8"?>
 +<ui version="4.0">
 + <class>LXQtResourceMonitorConfiguration</class>
@@ -827,8 +1173,8 @@ index 0000000..6aaf553
 +   <rect>
 +    <x>0</x>
 +    <y>0</y>
-+    <width>330</width>
-+    <height>225</height>
++    <width>380</width>
++    <height>410</height>
 +   </rect>
 +  </property>
 +  <property name="windowTitle">
@@ -836,6 +1182,54 @@ index 0000000..6aaf553
 +  </property>
 +  <layout class="QGridLayout" name="gridLayout_2">
 +   <item row="0" column="0">
++    <widget class="QGroupBox" name="resourcesGB">
++     <property name="title">
++      <string>Resources</string>
++     </property>
++     <layout class="QGridLayout" name="resourcesLayout">
++      <item row="0" column="0">
++       <widget class="QCheckBox" name="cpuCB">
++        <property name="text"><string>CPU</string></property>
++        <property name="checked"><bool>true</bool></property>
++       </widget>
++      </item>
++      <item row="0" column="1">
++       <widget class="QCheckBox" name="memoryCB">
++        <property name="text"><string>RAM</string></property>
++        <property name="checked"><bool>true</bool></property>
++       </widget>
++      </item>
++      <item row="1" column="0">
++       <widget class="QCheckBox" name="swapCB">
++        <property name="text"><string>SWAP</string></property>
++        <property name="checked"><bool>true</bool></property>
++       </widget>
++      </item>
++      <item row="1" column="1">
++       <widget class="QCheckBox" name="diskCB">
++        <property name="text"><string>Local disk I/O</string></property>
++       </widget>
++      </item>
++      <item row="2" column="0">
++       <widget class="QCheckBox" name="localNetCB">
++        <property name="text"><string>Local net (private IP)</string></property>
++        <property name="toolTip">
++         <string>Traffic to or from private/local IP addresses. Public IP traffic is counted as Internet.</string>
++        </property>
++       </widget>
++      </item>
++      <item row="2" column="1">
++       <widget class="QCheckBox" name="internetCB">
++        <property name="text"><string>Internet I/O</string></property>
++        <property name="toolTip">
++         <string>Traffic to or from public IP addresses.</string>
++        </property>
++       </widget>
++      </item>
++     </layout>
++    </widget>
++   </item>
++   <item row="1" column="0">
 +    <widget class="QGroupBox" name="generalGB">
 +     <property name="title">
 +      <string>General</string>
@@ -844,7 +1238,7 @@ index 0000000..6aaf553
 +      <item row="0" column="0" colspan="2">
 +       <widget class="QCheckBox" name="showTextCB">
 +        <property name="text">
-+         <string>Show percentages</string>
++         <string>Show values</string>
 +        </property>
 +        <property name="checked">
 +         <bool>true</bool>
@@ -908,18 +1302,24 @@ index 0000000..6aaf553
 +        <property name="maximum">
 +         <number>300</number>
 +        </property>
++        <property name="toolTip">
++         <string>This is the width for three resources. The widget scales with the number selected (57 px gives 19 px per resource).</string>
++        </property>
 +        <property name="singleStep">
 +         <number>1</number>
 +        </property>
 +        <property name="value">
-+         <number>78</number>
++         <number>57</number>
 +        </property>
 +       </widget>
 +      </item>
 +      <item row="4" column="0" colspan="2">
 +       <widget class="QLabel" name="colorHintLabel">
 +        <property name="text">
-+         <string>CPU: green   RAM: blue   SWAP: amber</string>
++         <string>CPU: green   RAM: blue   SWAP: amber   Disk: purple   Local net: teal   Internet: red</string>
++        </property>
++        <property name="wordWrap">
++         <bool>true</bool>
 +        </property>
 +        <property name="alignment">
 +         <set>Qt::AlignCenter</set>
@@ -929,7 +1329,7 @@ index 0000000..6aaf553
 +     </layout>
 +    </widget>
 +   </item>
-+   <item row="1" column="0">
++   <item row="2" column="0">
 +    <spacer name="verticalSpacer">
 +     <property name="orientation">
 +      <enum>Qt::Vertical</enum>
@@ -942,7 +1342,7 @@ index 0000000..6aaf553
 +     </property>
 +    </spacer>
 +   </item>
-+   <item row="2" column="0">
++   <item row="3" column="0">
 +    <widget class="QDialogButtonBox" name="buttons">
 +     <property name="orientation">
 +      <enum>Qt::Horizontal</enum>
@@ -1085,6 +1485,235 @@ index 0000000..f270861
 +};
 +
 +#endif // LXQTRESOURCEMONITORPLUGIN_H
+diff --git a/plugin-resourcemonitor/resourcemonitor-netcap.cpp b/plugin-resourcemonitor/resourcemonitor-netcap.cpp
+new file mode 100644
+index 0000000..4b902f3
+--- /dev/null
++++ b/plugin-resourcemonitor/resourcemonitor-netcap.cpp
+@@ -0,0 +1,223 @@
++/* BEGIN_COMMON_COPYRIGHT_HEADER
++ * (c)LGPL2+
++ *
++ * LXQt - a lightweight, Qt based, desktop toolset
++ * https://lxqt.org
++ *
++ * This program or library is free software; you can redistribute it
++ * and/or modify it under the terms of the GNU Lesser General Public
++ * License as published by the Free Software Foundation; either
++ * version 2.1 of the License, or (at your option) any later version.
++ *
++ * END_COMMON_COPYRIGHT_HEADER */
++
++#include <arpa/inet.h>
++#include <linux/capability.h>
++#include <linux/if_ether.h>
++#include <linux/if_packet.h>
++#include <net/if.h>
++#include <poll.h>
++#include <sys/prctl.h>
++#include <sys/socket.h>
++#include <sys/syscall.h>
++#include <unistd.h>
++
++#include <array>
++#include <chrono>
++#include <cstdint>
++#include <cstdio>
++#include <cstring>
++
++namespace
++{
++constexpr auto ReportInterval = std::chrono::milliseconds(250);
++constexpr std::size_t PacketBufferSize = 65536;
++
++struct TrafficCounters
++{
++    std::uint64_t localReceive{0};
++    std::uint64_t localTransmit{0};
++    std::uint64_t internetReceive{0};
++    std::uint64_t internetTransmit{0};
++};
++
++bool isLocalIpv4(std::uint32_t address)
++{
++    return (address & 0xff000000U) == 0x00000000U        // 0.0.0.0/8
++        || (address & 0xff000000U) == 0x0a000000U        // 10.0.0.0/8
++        || (address & 0xffc00000U) == 0x64400000U        // 100.64.0.0/10
++        || (address & 0xff000000U) == 0x7f000000U        // 127.0.0.0/8
++        || (address & 0xffff0000U) == 0xa9fe0000U        // 169.254.0.0/16
++        || (address & 0xfff00000U) == 0xac100000U        // 172.16.0.0/12
++        || (address & 0xffffff00U) == 0xc0000000U        // 192.0.0.0/24
++        || (address & 0xffffff00U) == 0xc0000200U        // 192.0.2.0/24
++        || (address & 0xffff0000U) == 0xc0a80000U        // 192.168.0.0/16
++        || (address & 0xfffe0000U) == 0xc6120000U        // 198.18.0.0/15
++        || (address & 0xffffff00U) == 0xc6336400U        // 198.51.100.0/24
++        || (address & 0xffffff00U) == 0xcb007100U        // 203.0.113.0/24
++        || (address & 0xf0000000U) == 0xe0000000U        // 224.0.0.0/4
++        || (address & 0xf0000000U) == 0xf0000000U;       // 240.0.0.0/4
++}
++
++bool isLocalIpv6(const in6_addr &address)
++{
++    if (IN6_IS_ADDR_UNSPECIFIED(&address)
++        || IN6_IS_ADDR_LOOPBACK(&address)
++        || IN6_IS_ADDR_LINKLOCAL(&address)
++        || IN6_IS_ADDR_SITELOCAL(&address)
++        || IN6_IS_ADDR_MULTICAST(&address)
++        || (address.s6_addr[0] & 0xfeU) == 0xfcU)          // fc00::/7
++    {
++        return true;
++    }
++
++    if (IN6_IS_ADDR_V4MAPPED(&address))
++    {
++        std::uint32_t ipv4Address = 0;
++        std::memcpy(&ipv4Address, &address.s6_addr[12], sizeof(ipv4Address));
++        return isLocalIpv4(ntohl(ipv4Address));
++    }
++
++    // IPv6 documentation prefix; it is not globally routable.
++    return address.s6_addr[0] == 0x20U
++        && address.s6_addr[1] == 0x01U
++        && address.s6_addr[2] == 0x0dU
++        && address.s6_addr[3] == 0xb8U;
++}
++
++bool dropCapabilities()
++{
++    __user_cap_header_struct header{};
++    header.version = _LINUX_CAPABILITY_VERSION_3;
++    header.pid = 0;
++    std::array<__user_cap_data_struct, 2> data{};
++    if (syscall(SYS_capset, &header, data.data()) != 0)
++        return false;
++
++    if (prctl(PR_SET_NO_NEW_PRIVS, 1, 0, 0, 0) != 0)
++        return false;
++
++    prctl(PR_SET_DUMPABLE, 0, 0, 0, 0);
++    return true;
++}
++
++bool classifyPacket(const std::uint8_t *packet,
++                    std::size_t packetLength,
++                    std::uint16_t protocol,
++                    bool outgoing,
++                    bool &isLocal)
++{
++    if (protocol == ETH_P_IP && packetLength >= 20 && (packet[0] >> 4) == 4)
++    {
++        const std::size_t headerLength = static_cast<std::size_t>(packet[0] & 0x0fU) * 4;
++        if (headerLength < 20 || packetLength < headerLength)
++            return false;
++
++        std::uint32_t sourceAddress = 0;
++        std::uint32_t destinationAddress = 0;
++        std::memcpy(&sourceAddress, packet + 12, sizeof(sourceAddress));
++        std::memcpy(&destinationAddress, packet + 16, sizeof(destinationAddress));
++        const std::uint32_t remoteAddress = ntohl(outgoing ? destinationAddress : sourceAddress);
++        isLocal = isLocalIpv4(remoteAddress);
++        return true;
++    }
++
++    if (protocol == ETH_P_IPV6 && packetLength >= 40 && (packet[0] >> 4) == 6)
++    {
++        in6_addr remoteAddress{};
++        std::memcpy(&remoteAddress, packet + (outgoing ? 24 : 8), sizeof(remoteAddress));
++        isLocal = isLocalIpv6(remoteAddress);
++        return true;
++    }
++
++    return false;
++}
++
++} // namespace
++
++int main()
++{
++    const int packetSocket = socket(AF_PACKET,
++                                    SOCK_DGRAM | SOCK_CLOEXEC,
++                                    htons(ETH_P_ALL));
++    if (packetSocket < 0)
++    {
++        std::fprintf(stderr, "resourcemonitor-netcap: CAP_NET_RAW is required\n");
++        return 1;
++    }
++
++    if (!dropCapabilities())
++    {
++        std::fprintf(stderr, "resourcemonitor-netcap: failed to drop capabilities\n");
++        close(packetSocket);
++        return 1;
++    }
++
++    const unsigned int loopbackIndex = if_nametoindex("lo");
++    std::array<std::uint8_t, PacketBufferSize> packetBuffer{};
++    TrafficCounters counters;
++    auto nextReport = std::chrono::steady_clock::now() + ReportInterval;
++
++    while (true)
++    {
++        const auto now = std::chrono::steady_clock::now();
++        const auto remaining = std::chrono::duration_cast<std::chrono::milliseconds>(nextReport - now);
++        const int timeout = static_cast<int>(remaining.count() > 0 ? remaining.count() : 0);
++        pollfd descriptor{packetSocket, POLLIN, 0};
++        const int pollResult = poll(&descriptor, 1, timeout);
++
++        if (pollResult > 0 && (descriptor.revents & POLLIN) != 0)
++        {
++            sockaddr_ll source{};
++            socklen_t sourceLength = sizeof(source);
++            const ssize_t packetLength = recvfrom(packetSocket,
++                                                  packetBuffer.data(),
++                                                  packetBuffer.size(),
++                                                  0,
++                                                  reinterpret_cast<sockaddr *>(&source),
++                                                  &sourceLength);
++            if (packetLength > 0
++                && source.sll_ifindex != static_cast<int>(loopbackIndex)
++                && source.sll_pkttype != PACKET_LOOPBACK)
++            {
++                bool localDestination = false;
++                if (classifyPacket(packetBuffer.data(),
++                                   static_cast<std::size_t>(packetLength),
++                                   ntohs(source.sll_protocol),
++                                   source.sll_pkttype == PACKET_OUTGOING,
++                                   localDestination))
++                {
++                    const std::uint64_t bytes = static_cast<std::uint64_t>(packetLength);
++                    const bool outgoing = source.sll_pkttype == PACKET_OUTGOING;
++                    if (localDestination)
++                    {
++                        if (outgoing)
++                            counters.localTransmit += bytes;
++                        else
++                            counters.localReceive += bytes;
++                    }
++                    else if (outgoing)
++                    {
++                        counters.internetTransmit += bytes;
++                    }
++                    else
++                    {
++                        counters.internetReceive += bytes;
++                    }
++                }
++            }
++        }
++
++        if (std::chrono::steady_clock::now() >= nextReport)
++        {
++            std::printf("%llu %llu %llu %llu\n",
++                        static_cast<unsigned long long>(counters.localReceive),
++                        static_cast<unsigned long long>(counters.localTransmit),
++                        static_cast<unsigned long long>(counters.internetReceive),
++                        static_cast<unsigned long long>(counters.internetTransmit));
++            std::fflush(stdout);
++            counters = {};
++            nextReport = std::chrono::steady_clock::now() + ReportInterval;
++        }
++    }
++}
 diff --git a/plugin-resourcemonitor/resourcemonitormath.cpp b/plugin-resourcemonitor/resourcemonitormath.cpp
 new file mode 100644
 index 0000000..e62ac47

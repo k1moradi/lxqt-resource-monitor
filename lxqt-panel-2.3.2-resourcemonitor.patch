@@ -45,10 +45,10 @@ index 0000000..9c1116c
 +BUILD_LXQT_PLUGIN(${PLUGIN})
 diff --git a/plugin-resourcemonitor/lxqtresourcemonitor.cpp b/plugin-resourcemonitor/lxqtresourcemonitor.cpp
 new file mode 100644
-index 0000000..c6319dc
+index 0000000..52ba2dc
 --- /dev/null
 +++ b/plugin-resourcemonitor/lxqtresourcemonitor.cpp
-@@ -0,0 +1,485 @@
+@@ -0,0 +1,468 @@
 +/* BEGIN_COMMON_COPYRIGHT_HEADER
 + * (c)LGPL2+
 + *
@@ -383,27 +383,10 @@ index 0000000..c6319dc
 +        return;
 +    }
 +
-+#ifdef STATGRAB_NEWER_THAN_0_90
-+    size_t cpuCount = 0;
-+    const sg_cpu_percents *cpuPercentages = sg_get_cpu_percents(&cpuCount);
-+    cpuSnapshot.valid = cpuPercentages != nullptr && cpuCount > 0;
-+#else
-+    const sg_cpu_percents *cpuPercentages = sg_get_cpu_percents();
-+    cpuSnapshot.valid = cpuPercentages != nullptr;
-+#endif
-+    if (cpuSnapshot.valid)
-+    {
-+        // Match the existing LXQt CPU Monitor: user + kernel + nice.
-+        cpuSnapshot.percent = std::clamp(static_cast<double>(cpuPercentages->user
-+                                                             + cpuPercentages->kernel
-+                                                             + cpuPercentages->nice),
-+                                         0.0,
-+                                         100.0);
-+    }
-+    else
-+    {
-+        cpuSnapshot.percent = 0.0;
-+    }
++    const ResourceMonitorMath::CpuUsageSample cpuUsage =
++        ResourceMonitorMath::sampleCpuUsage();
++    cpuSnapshot.valid = cpuUsage.valid;
++    cpuSnapshot.percent = cpuUsage.percent;
 +
 +#ifdef STATGRAB_NEWER_THAN_0_90
 +    size_t memoryCount = 0;
@@ -1104,10 +1087,10 @@ index 0000000..f270861
 +#endif // LXQTRESOURCEMONITORPLUGIN_H
 diff --git a/plugin-resourcemonitor/resourcemonitormath.cpp b/plugin-resourcemonitor/resourcemonitormath.cpp
 new file mode 100644
-index 0000000..64f40f9
+index 0000000..e62ac47
 --- /dev/null
 +++ b/plugin-resourcemonitor/resourcemonitormath.cpp
-@@ -0,0 +1,46 @@
+@@ -0,0 +1,70 @@
 +/* BEGIN_COMMON_COPYRIGHT_HEADER
 + * (c)LGPL2+
 + *
@@ -1127,6 +1110,30 @@ index 0000000..64f40f9
 +
 +namespace ResourceMonitorMath
 +{
++CpuUsageSample makeCpuUsageSample(const sg_cpu_percents *sample, std::size_t reportedEntries)
++{
++    // libstatgrab 0.92 can return its aggregate CPU sample with entries == 0.
++    // The pointer, as used by LXQt's own CPU Monitor, is the availability signal.
++    (void)reportedEntries;
++    if (sample == nullptr)
++        return {false, 0.0, reportedEntries};
++
++    const double percent = sample->user + sample->kernel + sample->nice;
++    return {true, std::clamp(percent, 0.0, 100.0), reportedEntries};
++}
++
++CpuUsageSample sampleCpuUsage()
++{
++    std::size_t reportedEntries = 0;
++#ifdef __sg_public
++    const sg_cpu_percents *sample = sg_get_cpu_percents(&reportedEntries);
++#else
++    const sg_cpu_percents *sample = sg_get_cpu_percents();
++    reportedEntries = sample != nullptr ? 1 : 0;
++#endif
++    return makeCpuUsageSample(sample, reportedEntries);
++}
++
 +double calculatePercent(quint64 used, quint64 total)
 +{
 +    if (total == 0)
@@ -1156,10 +1163,10 @@ index 0000000..64f40f9
 +} // namespace ResourceMonitorMath
 diff --git a/plugin-resourcemonitor/resourcemonitormath.h b/plugin-resourcemonitor/resourcemonitormath.h
 new file mode 100644
-index 0000000..07decaa
+index 0000000..e40b655
 --- /dev/null
 +++ b/plugin-resourcemonitor/resourcemonitormath.h
-@@ -0,0 +1,27 @@
+@@ -0,0 +1,39 @@
 +/* BEGIN_COMMON_COPYRIGHT_HEADER
 + * (c)LGPL2+
 + *
@@ -1178,10 +1185,22 @@ index 0000000..07decaa
 +
 +#include <QString>
 +
++#include <cstddef>
 +#include <QtGlobal>
++
++#include <statgrab.h>
 +
 +namespace ResourceMonitorMath
 +{
++struct CpuUsageSample
++{
++    bool valid{false};
++    double percent{0.0};
++    std::size_t reportedEntries{0};
++};
++
++[[nodiscard]] CpuUsageSample makeCpuUsageSample(const sg_cpu_percents *sample, std::size_t reportedEntries);
++[[nodiscard]] CpuUsageSample sampleCpuUsage();
 +[[nodiscard]] double calculatePercent(quint64 used, quint64 total);
 +[[nodiscard]] QString formatBytes(quint64 bytes);
 +} // namespace ResourceMonitorMath

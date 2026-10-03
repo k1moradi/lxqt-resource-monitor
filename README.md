@@ -17,10 +17,10 @@ RAM usage uses libstatgrab's `used / total` values. On Linux, libstatgrab treats
 
 ## Run the CTests
 
-The tests cover the percentage calculation and byte formatting helpers used by the plugin. On Ubuntu/Lubuntu:
+The CTests cover resource formatting, the CPU sample validity rule, and a live libstatgrab CPU query. The regression test includes the libstatgrab 0.92 behavior where a non-null aggregate CPU sample reports zero entries. On Ubuntu/Lubuntu:
 
 ```bash
-sudo apt install build-essential cmake qt6-base-dev
+sudo apt install build-essential cmake ninja-build qt6-base-dev libstatgrab-dev
 cmake -S . -B build -G Ninja -DCMAKE_BUILD_TYPE=Debug
 cmake --build build
 ctest --test-dir build --output-on-failure

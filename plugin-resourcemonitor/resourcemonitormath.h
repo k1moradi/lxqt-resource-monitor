@@ -16,10 +16,22 @@
 
 #include <QString>
 
+#include <cstddef>
 #include <QtGlobal>
+
+#include <statgrab.h>
 
 namespace ResourceMonitorMath
 {
+struct CpuUsageSample
+{
+    bool valid{false};
+    double percent{0.0};
+    std::size_t reportedEntries{0};
+};
+
+[[nodiscard]] CpuUsageSample makeCpuUsageSample(const sg_cpu_percents *sample, std::size_t reportedEntries);
+[[nodiscard]] CpuUsageSample sampleCpuUsage();
 [[nodiscard]] double calculatePercent(quint64 used, quint64 total);
 [[nodiscard]] QString formatBytes(quint64 bytes);
 } // namespace ResourceMonitorMath

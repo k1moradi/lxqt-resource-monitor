@@ -332,27 +332,10 @@ void LXQtResourceMonitor::refreshStats()
         return;
     }
 
-#ifdef STATGRAB_NEWER_THAN_0_90
-    size_t cpuCount = 0;
-    const sg_cpu_percents *cpuPercentages = sg_get_cpu_percents(&cpuCount);
-    cpuSnapshot.valid = cpuPercentages != nullptr && cpuCount > 0;
-#else
-    const sg_cpu_percents *cpuPercentages = sg_get_cpu_percents();
-    cpuSnapshot.valid = cpuPercentages != nullptr;
-#endif
-    if (cpuSnapshot.valid)
-    {
-        // Match the existing LXQt CPU Monitor: user + kernel + nice.
-        cpuSnapshot.percent = std::clamp(static_cast<double>(cpuPercentages->user
-                                                             + cpuPercentages->kernel
-                                                             + cpuPercentages->nice),
-                                         0.0,
-                                         100.0);
-    }
-    else
-    {
-        cpuSnapshot.percent = 0.0;
-    }
+    const ResourceMonitorMath::CpuUsageSample cpuUsage =
+        ResourceMonitorMath::sampleCpuUsage();
+    cpuSnapshot.valid = cpuUsage.valid;
+    cpuSnapshot.percent = cpuUsage.percent;
 
 #ifdef STATGRAB_NEWER_THAN_0_90
     size_t memoryCount = 0;

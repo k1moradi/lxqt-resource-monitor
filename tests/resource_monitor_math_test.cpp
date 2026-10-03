@@ -30,6 +30,25 @@ void checkBytes(quint64 bytes, const char *expected, const char *description)
 
 int main()
 {
+    sg_cpu_percents cpuSample{};
+    cpuSample.user = 20.0;
+    cpuSample.kernel = 10.0;
+    cpuSample.nice = 5.0;
+    const auto zeroEntrySample = ResourceMonitorMath::makeCpuUsageSample(&cpuSample, 0);
+    check(zeroEntrySample.valid, "non-null CPU sample remains valid when reported entries is zero");
+    check(std::abs(zeroEntrySample.percent - 35.0) < 0.001, "CPU usage sums user, kernel, and nice");
+
+    sg_cpu_percents highCpuSample{};
+    highCpuSample.user = 80.0;
+    highCpuSample.kernel = 30.0;
+    const auto clampedCpuSample = ResourceMonitorMath::makeCpuUsageSample(&highCpuSample, 0);
+    check(clampedCpuSample.valid, "high non-null CPU sample remains valid");
+    check(clampedCpuSample.percent == 100.0, "CPU percentage is clamped to 100");
+
+    const auto missingCpuSample = ResourceMonitorMath::makeCpuUsageSample(nullptr, 0);
+    check(!missingCpuSample.valid, "null CPU sample is unavailable");
+    check(missingCpuSample.percent == 0.0, "missing CPU sample has a safe zero value");
+
     checkPercent(0, 0, 0.0, "zero total produces zero percent");
     checkPercent(25, 100, 25.0, "ordinary percentage");
     checkPercent(1, 3, 100.0 / 3.0, "fractional percentage precision");

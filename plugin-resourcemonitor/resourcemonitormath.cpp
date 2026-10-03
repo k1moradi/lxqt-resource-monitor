@@ -17,6 +17,30 @@
 
 namespace ResourceMonitorMath
 {
+CpuUsageSample makeCpuUsageSample(const sg_cpu_percents *sample, std::size_t reportedEntries)
+{
+    // libstatgrab 0.92 can return its aggregate CPU sample with entries == 0.
+    // The pointer, as used by LXQt's own CPU Monitor, is the availability signal.
+    (void)reportedEntries;
+    if (sample == nullptr)
+        return {false, 0.0, reportedEntries};
+
+    const double percent = sample->user + sample->kernel + sample->nice;
+    return {true, std::clamp(percent, 0.0, 100.0), reportedEntries};
+}
+
+CpuUsageSample sampleCpuUsage()
+{
+    std::size_t reportedEntries = 0;
+#ifdef __sg_public
+    const sg_cpu_percents *sample = sg_get_cpu_percents(&reportedEntries);
+#else
+    const sg_cpu_percents *sample = sg_get_cpu_percents();
+    reportedEntries = sample != nullptr ? 1 : 0;
+#endif
+    return makeCpuUsageSample(sample, reportedEntries);
+}
+
 double calculatePercent(quint64 used, quint64 total)
 {
     if (total == 0)

@@ -35,11 +35,11 @@ Install the build dependencies using Ubuntu's package metadata:
 
 ```bash
 sudo apt update
-sudo apt install build-essential cmake ninja-build git devscripts libstatgrab-dev libcap2-bin
+sudo apt install build-essential cmake ninja-build git devscripts dpkg-dev libstatgrab-dev libcap2-bin
 sudo apt build-dep lxqt-panel
 ```
 
-`apt build-dep` requires Ubuntu `deb-src` entries. Enable those entries and run `sudo apt update` if the command reports that source repositories are disabled.
+If `apt build-dep` prints `You must put some 'deb-src' URIs in your sources.list`, enable source-package entries on the **build computer**. The default Lubuntu 26.04 setup uses `/etc/apt/sources.list.d/ubuntu.sources`: edit each Ubuntu archive and security stanza, changing `Types: deb` to `Types: deb deb-src`, then run `sudo apt update` and retry `sudo apt build-dep lxqt-panel`. Keep each stanza's existing URI, suite, components and signing key. For older one-line `.list` files, add a matching `deb-src` line for each Ubuntu `deb` line. APT uses `deb-src` entries to retrieve source package metadata for `build-dep` ([APT sources.list manual](https://manpages.ubuntu.com/manpages/resolute/man5/sources.list.5.html)).
 
 Apply the patch to a clean upstream checkout:
 
@@ -53,10 +53,29 @@ Configure and build just the new plugin:
 
 ```bash
 cmake -S . -B build -G Ninja -DCMAKE_BUILD_TYPE=RelWithDebInfo
-cmake --build build --target resourcemonitor
+cmake --build build --target resourcemonitor resourcemonitor-netcap
 ```
 
 The resulting files include `build/plugin-resourcemonitor/libresourcemonitor.so`, `build/plugin-resourcemonitor/resourcemonitor.desktop` and `build/plugin-resourcemonitor/resourcemonitor-netcap`.
+
+## Build a binary Debian package
+
+You can compile on one computer and install a binary `.deb` on another. The target computer does not need `deb-src`, a compiler, or the LXQt Panel source tree. Build the plugin as above, then, from this repository, run:
+
+```bash
+./packaging/build-deb.sh \
+    /path/to/lxqt-panel/build/plugin-resourcemonitor \
+    1.0.0-1 \
+    build/packages
+```
+
+The script packages the plugin, desktop entry and capture helper; it also records the build computer's exact `lxqt-panel` package version and detects shared-library dependencies. It creates a package such as `build/packages/lxqt-resource-monitor_1.0.0-1_amd64.deb` (the architecture suffix varies). Copy that `.deb` to the other computer and install it with APT so missing runtime dependencies are fetched:
+
+```bash
+sudo apt install ./lxqt-resource-monitor_1.0.0-1_amd64.deb
+```
+
+The `.deb` is architecture and Ubuntu-release specific. Build and install it on computers with the same CPU architecture, Ubuntu/Lubuntu release and exact `lxqt-panel` package version; the plugin uses LXQt Panel's private plugin interface. The package's post-install step gives only `resourcemonitor-netcap` the `CAP_NET_RAW` capability needed for IP-based local-versus-public traffic counts. No source-package repositories are needed on the target computer. After installation, restart LXQt Panel and add **Resource Monitor** in **Panel Settings → Widgets**. To remove the package, run `sudo apt remove lxqt-resource-monitor`.
 
 ## Install for all users
 

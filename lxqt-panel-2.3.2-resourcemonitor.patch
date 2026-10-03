@@ -1,0 +1,1219 @@
+diff --git a/CMakeLists.txt b/CMakeLists.txt
+index f731bfb..c1e5879 100644
+--- a/CMakeLists.txt
++++ b/CMakeLists.txt
+@@ -103,0 +104,11 @@ endif()
++setByDefault(RESOURCEMONITOR_PLUGIN Yes)
++if(RESOURCEMONITOR_PLUGIN)
++    find_library(STATGRAB_LIB statgrab)
++
++    if(NOT STATGRAB_LIB)
++        message(FATAL_ERROR "Resource Monitor plugin requires libstatgrab")
++    endif()
++    list(APPEND ENABLED_PLUGINS "Resource Monitor")
++    add_subdirectory(plugin-resourcemonitor)
++endif()
++
+diff --git a/plugin-resourcemonitor/CMakeLists.txt b/plugin-resourcemonitor/CMakeLists.txt
+new file mode 100644
+index 0000000..9c1116c
+--- /dev/null
++++ b/plugin-resourcemonitor/CMakeLists.txt
+@@ -0,0 +1,23 @@
++set(PLUGIN "resourcemonitor")
++
++set(HEADERS
++    lxqtresourcemonitorplugin.h
++    lxqtresourcemonitor.h
++    lxqtresourcemonitorconfiguration.h
++    resourcemonitormath.h
++)
++
++set(SOURCES
++    lxqtresourcemonitorplugin.cpp
++    lxqtresourcemonitor.cpp
++    lxqtresourcemonitorconfiguration.cpp
++    resourcemonitormath.cpp
++)
++
++set(UIS
++    lxqtresourcemonitorconfiguration.ui
++)
++
++set(LIBRARIES ${STATGRAB_LIB})
++
++BUILD_LXQT_PLUGIN(${PLUGIN})
+diff --git a/plugin-resourcemonitor/lxqtresourcemonitor.cpp b/plugin-resourcemonitor/lxqtresourcemonitor.cpp
+new file mode 100644
+index 0000000..c6319dc
+--- /dev/null
++++ b/plugin-resourcemonitor/lxqtresourcemonitor.cpp
+@@ -0,0 +1,485 @@
++/* BEGIN_COMMON_COPYRIGHT_HEADER
++ * (c)LGPL2+
++ *
++ * LXQt - a lightweight, Qt based, desktop toolset
++ * https://lxqt.org
++ *
++ * This program or library is free software; you can redistribute it
++ * and/or modify it under the terms of the GNU Lesser General Public
++ * License as published by the Free Software Foundation; either
++ * version 2.1 of the License, or (at your option) any later version.
++ *
++ * This library is distributed in the hope that it will be useful,
++ * but WITHOUT ANY WARRANTY; without even the implied warranty of
++ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the GNU
++ * Lesser General Public License for more details.
++ *
++ * END_COMMON_COPYRIGHT_HEADER */
++
++#include "lxqtresourcemonitor.h"
++#include "resourcemonitormath.h"
++
++#include "../panel/ilxqtpanelplugin.h"
++#include "../panel/pluginsettings.h"
++
++#include <QDebug>
++#include <QFontMetrics>
++#include <QHBoxLayout>
++#include <QLinearGradient>
++#include <QPainter>
++#include <QPalette>
++#include <QStringList>
++#include <QTimerEvent>
++
++#include <algorithm>
++#include <cmath>
++
++extern "C" {
++#include <statgrab.h>
++}
++
++#ifdef __sg_public
++// libstatgrab 0.90 and newer define this macro.
++#define STATGRAB_NEWER_THAN_0_90 1
++#endif
++
++namespace
++{
++constexpr auto BarOrientTopDown = "topDown";
++constexpr auto BarOrientLeftRight = "leftRight";
++constexpr auto BarOrientRightLeft = "rightLeft";
++
++constexpr int MeterCount = 3;
++constexpr int OuterMargin = 1;
++constexpr int MeterGap = 1;
++constexpr int MeterInnerMargin = 1;
++constexpr int TextHorizontalPadding = 1;
++constexpr int PreferredTextPixelSize = 10;
++constexpr int MinimumTextPixelSize = 7;
++
++} // namespace
++
++LXQtResourceMonitor::LXQtResourceMonitor(ILXQtPanelPlugin *plugin, QWidget *parent)
++    : QFrame(parent)
++    , m_plugin(plugin)
++{
++    setObjectName(QStringLiteral("LXQtResourceMonitor"));
++
++    auto *layout = new QHBoxLayout(this);
++    layout->setSpacing(0);
++    layout->setContentsMargins(0, 0, 0, 0);
++    layout->addWidget(&m_sizingWidget);
++
++#ifdef STATGRAB_NEWER_THAN_0_90
++    const sg_error initResult = sg_init(0);
++#else
++    const sg_error initResult = sg_init();
++#endif
++    if (initResult == SG_ERROR_NONE)
++    {
++        m_statgrabInitialized = true;
++        if (sg_drop_privileges() != SG_ERROR_NONE)
++            qWarning() << "Resource Monitor: failed to drop libstatgrab privileges";
++    }
++    else
++    {
++        qWarning() << "Resource Monitor: libstatgrab initialization failed";
++    }
++
++    // Keep the text compact, like the existing CPU Monitor. Pixel sizing is
++    // predictable on narrow panel widgets and is reduced further when needed.
++    m_font.setPixelSize(PreferredTextPixelSize);
++
++    settingsChanged();
++    refreshStats();
++}
++
++LXQtResourceMonitor::~LXQtResourceMonitor()
++{
++    if (m_timerId != -1)
++        killTimer(m_timerId);
++
++    if (m_statgrabInitialized)
++        sg_shutdown();
++}
++
++bool LXQtResourceMonitor::isVerticalBarOrientation() const
++{
++    return m_barOrientation == BottomUpBar || m_barOrientation == TopDownBar;
++}
++
++void LXQtResourceMonitor::setSizes()
++{
++    // Width is the user-facing footprint of the complete three-meter widget.
++    // Height is controlled by the panel.
++    m_sizingWidget.setFixedWidth(m_widgetWidth);
++    m_sizingWidget.setMinimumHeight(24);
++}
++
++void LXQtResourceMonitor::resizeEvent(QResizeEvent *event)
++{
++    QFrame::resizeEvent(event);
++    setSizes();
++    update();
++}
++
++QRect LXQtResourceMonitor::meterRect(std::size_t resourceIndexValue) const
++{
++    const QRect availableRectangle = rect().adjusted(OuterMargin,
++                                                      OuterMargin,
++                                                      -OuterMargin,
++                                                      -OuterMargin);
++    if (availableRectangle.isEmpty() || resourceIndexValue >= static_cast<std::size_t>(MeterCount))
++        return {};
++
++    if (isVerticalBarOrientation())
++    {
++        const int usableWidth = std::max(0, availableRectangle.width() - MeterGap * (MeterCount - 1));
++        const int baseWidth = usableWidth / MeterCount;
++        const int remainder = usableWidth % MeterCount;
++
++        int x = availableRectangle.left();
++        for (std::size_t index = 0; index < resourceIndexValue; ++index)
++            x += baseWidth + (static_cast<int>(index) < remainder ? 1 : 0) + MeterGap;
++
++        const int width = baseWidth + (static_cast<int>(resourceIndexValue) < remainder ? 1 : 0);
++        return QRect(x, availableRectangle.top(), width, availableRectangle.height());
++    }
++
++    const int usableHeight = std::max(0, availableRectangle.height() - MeterGap * (MeterCount - 1));
++    const int baseHeight = usableHeight / MeterCount;
++    const int remainder = usableHeight % MeterCount;
++
++    int y = availableRectangle.top();
++    for (std::size_t index = 0; index < resourceIndexValue; ++index)
++        y += baseHeight + (static_cast<int>(index) < remainder ? 1 : 0) + MeterGap;
++
++    const int height = baseHeight + (static_cast<int>(resourceIndexValue) < remainder ? 1 : 0);
++    return QRect(availableRectangle.left(), y, availableRectangle.width(), height);
++}
++
++QRect LXQtResourceMonitor::fillRect(const QRect &meterRectangle, double percent) const
++{
++    if (meterRectangle.isEmpty())
++        return {};
++
++    const QRect innerRectangle = meterRectangle.adjusted(MeterInnerMargin,
++                                                          MeterInnerMargin,
++                                                          -MeterInnerMargin,
++                                                          -MeterInnerMargin);
++    if (innerRectangle.isEmpty())
++        return {};
++
++    const double boundedPercent = std::clamp(percent, 0.0, 100.0);
++    const double fraction = boundedPercent / 100.0;
++
++    if (isVerticalBarOrientation())
++    {
++        const int filledHeight = std::clamp(static_cast<int>(std::lround(innerRectangle.height() * fraction)),
++                                            0,
++                                            innerRectangle.height());
++        if (filledHeight == 0)
++            return {};
++
++        if (m_barOrientation == TopDownBar)
++            return QRect(innerRectangle.left(), innerRectangle.top(), innerRectangle.width(), filledHeight);
++
++        return QRect(innerRectangle.left(),
++                     innerRectangle.bottom() - filledHeight + 1,
++                     innerRectangle.width(),
++                     filledHeight);
++    }
++
++    const int filledWidth = std::clamp(static_cast<int>(std::lround(innerRectangle.width() * fraction)),
++                                       0,
++                                       innerRectangle.width());
++    if (filledWidth == 0)
++        return {};
++
++    if (m_barOrientation == RightToLeftBar)
++    {
++        return QRect(innerRectangle.right() - filledWidth + 1,
++                     innerRectangle.top(),
++                     filledWidth,
++                     innerRectangle.height());
++    }
++
++    return QRect(innerRectangle.left(), innerRectangle.top(), filledWidth, innerRectangle.height());
++}
++
++QColor LXQtResourceMonitor::resourceLightColor(Resource resource) const
++{
++    switch (resource)
++    {
++    case Resource::Cpu:
++        return QColor(0, 196, 0, 160);       // Existing CPU Monitor family.
++    case Resource::Memory:
++        return QColor(48, 156, 255, 170);    // Blue: physical memory.
++    case Resource::Swap:
++        return QColor(255, 181, 32, 180);    // Amber: swap.
++    case Resource::Count:
++        break;
++    }
++    return palette().color(QPalette::Highlight);
++}
++
++QColor LXQtResourceMonitor::resourceDarkColor(Resource resource) const
++{
++    switch (resource)
++    {
++    case Resource::Cpu:
++        return QColor(0, 128, 0, 255);
++    case Resource::Memory:
++        return QColor(0, 92, 184, 255);
++    case Resource::Swap:
++        return QColor(196, 112, 0, 255);
++    case Resource::Count:
++        break;
++    }
++    return palette().color(QPalette::Highlight);
++}
++
++QFont LXQtResourceMonitor::fittedTextFont(const QRect &meterRectangle) const
++{
++    QFont font = m_font;
++    const QString widestText = QStringLiteral("100%");
++    const int availableWidth = std::max(1, meterRectangle.width() - 2 * TextHorizontalPadding);
++    const int availableHeight = std::max(1, meterRectangle.height() - 2);
++
++    for (int pixelSize = PreferredTextPixelSize; pixelSize >= MinimumTextPixelSize; --pixelSize)
++    {
++        font.setPixelSize(pixelSize);
++        const QFontMetrics metrics(font);
++        if (metrics.horizontalAdvance(widestText) <= availableWidth && metrics.height() <= availableHeight)
++            return font;
++    }
++
++    font.setPixelSize(MinimumTextPixelSize);
++    return font;
++}
++
++void LXQtResourceMonitor::drawMeter(QPainter &painter,
++                                    Resource resource,
++                                    const QRect &meterRectangle)
++{
++    if (meterRectangle.isEmpty())
++        return;
++
++    const QColor lightColor = resourceLightColor(resource);
++    const QColor darkColor = resourceDarkColor(resource);
++
++    // A resource-colored outline remains visible even at 0%, so CPU/RAM/SWAP
++    // are distinguishable without spending panel width on text labels.
++    QColor outlineColor = darkColor;
++    outlineColor.setAlpha(150);
++    painter.setPen(QPen(outlineColor, 1));
++    painter.drawRect(meterRectangle.adjusted(0, 0, -1, -1));
++
++    const ResourceSnapshot &snapshot = m_resources[resourceIndex(resource)];
++    const QRect filledRectangle = fillRect(meterRectangle, snapshot.valid ? snapshot.percent : 0.0);
++    if (!filledRectangle.isEmpty())
++    {
++        QLinearGradient gradient;
++        if (isVerticalBarOrientation())
++            gradient = QLinearGradient(filledRectangle.left(), 0, filledRectangle.right(), 0);
++        else
++            gradient = QLinearGradient(0, filledRectangle.top(), 0, filledRectangle.bottom());
++
++        gradient.setSpread(QLinearGradient::ReflectSpread);
++        gradient.setColorAt(0.0, lightColor);
++        gradient.setColorAt(0.5, darkColor);
++        gradient.setColorAt(1.0, lightColor);
++        painter.fillRect(filledRectangle, gradient);
++    }
++
++    if (!m_showText)
++        return;
++
++    painter.setFont(fittedTextFont(meterRectangle));
++    painter.setPen(m_fontColor.isValid() ? m_fontColor : palette().color(QPalette::WindowText));
++
++    const QString text = snapshot.valid
++        ? QStringLiteral("%1%").arg(qRound(snapshot.percent))
++        : QStringLiteral("--");
++    painter.drawText(meterRectangle, Qt::AlignCenter, text);
++}
++
++void LXQtResourceMonitor::paintEvent(QPaintEvent *event)
++{
++    Q_UNUSED(event)
++
++    QPainter painter(this);
++    painter.setRenderHint(QPainter::Antialiasing, false);
++
++    drawMeter(painter, Resource::Cpu, meterRect(resourceIndex(Resource::Cpu)));
++    drawMeter(painter, Resource::Memory, meterRect(resourceIndex(Resource::Memory)));
++    drawMeter(painter, Resource::Swap, meterRect(resourceIndex(Resource::Swap)));
++}
++
++void LXQtResourceMonitor::refreshStats()
++{
++    auto &cpuSnapshot = m_resources[resourceIndex(Resource::Cpu)];
++    auto &memorySnapshot = m_resources[resourceIndex(Resource::Memory)];
++    auto &swapSnapshot = m_resources[resourceIndex(Resource::Swap)];
++
++    if (!m_statgrabInitialized)
++    {
++        cpuSnapshot.valid = false;
++        memorySnapshot.valid = false;
++        swapSnapshot.valid = false;
++        updateToolTip();
++        update();
++        return;
++    }
++
++#ifdef STATGRAB_NEWER_THAN_0_90
++    size_t cpuCount = 0;
++    const sg_cpu_percents *cpuPercentages = sg_get_cpu_percents(&cpuCount);
++    cpuSnapshot.valid = cpuPercentages != nullptr && cpuCount > 0;
++#else
++    const sg_cpu_percents *cpuPercentages = sg_get_cpu_percents();
++    cpuSnapshot.valid = cpuPercentages != nullptr;
++#endif
++    if (cpuSnapshot.valid)
++    {
++        // Match the existing LXQt CPU Monitor: user + kernel + nice.
++        cpuSnapshot.percent = std::clamp(static_cast<double>(cpuPercentages->user
++                                                             + cpuPercentages->kernel
++                                                             + cpuPercentages->nice),
++                                         0.0,
++                                         100.0);
++    }
++    else
++    {
++        cpuSnapshot.percent = 0.0;
++    }
++
++#ifdef STATGRAB_NEWER_THAN_0_90
++    size_t memoryCount = 0;
++    const sg_mem_stats *memoryStats = sg_get_mem_stats(&memoryCount);
++    memorySnapshot.valid = memoryStats != nullptr && memoryCount > 0;
++#else
++    const sg_mem_stats *memoryStats = sg_get_mem_stats();
++    memorySnapshot.valid = memoryStats != nullptr;
++#endif
++    if (memorySnapshot.valid)
++    {
++        memorySnapshot.usedBytes = static_cast<quint64>(memoryStats->used);
++        memorySnapshot.totalBytes = static_cast<quint64>(memoryStats->total);
++        memorySnapshot.percent = ResourceMonitorMath::calculatePercent(memorySnapshot.usedBytes, memorySnapshot.totalBytes);
++    }
++    else
++    {
++        memorySnapshot.percent = 0.0;
++        memorySnapshot.usedBytes = 0;
++        memorySnapshot.totalBytes = 0;
++    }
++
++#ifdef STATGRAB_NEWER_THAN_0_90
++    size_t swapCount = 0;
++    const sg_swap_stats *swapStats = sg_get_swap_stats(&swapCount);
++    swapSnapshot.valid = swapStats != nullptr && swapCount > 0;
++#else
++    const sg_swap_stats *swapStats = sg_get_swap_stats();
++    swapSnapshot.valid = swapStats != nullptr;
++#endif
++    if (swapSnapshot.valid)
++    {
++        swapSnapshot.usedBytes = static_cast<quint64>(swapStats->used);
++        swapSnapshot.totalBytes = static_cast<quint64>(swapStats->total);
++        swapSnapshot.percent = ResourceMonitorMath::calculatePercent(swapSnapshot.usedBytes, swapSnapshot.totalBytes);
++    }
++    else
++    {
++        swapSnapshot.percent = 0.0;
++        swapSnapshot.usedBytes = 0;
++        swapSnapshot.totalBytes = 0;
++    }
++
++    updateToolTip();
++    update();
++}
++
++void LXQtResourceMonitor::updateToolTip()
++{
++    const ResourceSnapshot &cpuSnapshot = m_resources[resourceIndex(Resource::Cpu)];
++    const ResourceSnapshot &memorySnapshot = m_resources[resourceIndex(Resource::Memory)];
++    const ResourceSnapshot &swapSnapshot = m_resources[resourceIndex(Resource::Swap)];
++
++    QStringList lines;
++    lines.reserve(3);
++
++    lines.emplaceBack(cpuSnapshot.valid
++        ? tr("CPU: %1%").arg(qRound(cpuSnapshot.percent))
++        : tr("CPU: unavailable"));
++
++    lines.emplaceBack(memorySnapshot.valid
++        ? tr("RAM: %1% — %2 / %3")
++              .arg(qRound(memorySnapshot.percent))
++              .arg(ResourceMonitorMath::formatBytes(memorySnapshot.usedBytes))
++              .arg(ResourceMonitorMath::formatBytes(memorySnapshot.totalBytes))
++        : tr("RAM: unavailable"));
++
++    if (!swapSnapshot.valid)
++    {
++        lines.emplaceBack(tr("SWAP: unavailable"));
++    }
++    else if (swapSnapshot.totalBytes == 0)
++    {
++        lines.emplaceBack(tr("SWAP: not configured"));
++    }
++    else
++    {
++        lines.emplaceBack(tr("SWAP: %1% — %2 / %3")
++                              .arg(qRound(swapSnapshot.percent))
++                              .arg(ResourceMonitorMath::formatBytes(swapSnapshot.usedBytes))
++                              .arg(ResourceMonitorMath::formatBytes(swapSnapshot.totalBytes)));
++    }
++
++    setToolTip(lines.join(QLatin1Char('\n')));
++}
++
++void LXQtResourceMonitor::timerEvent(QTimerEvent *event)
++{
++    if (event->timerId() != m_timerId)
++    {
++        QFrame::timerEvent(event);
++        return;
++    }
++
++    refreshStats();
++}
++
++void LXQtResourceMonitor::settingsChanged()
++{
++    if (m_timerId != -1)
++    {
++        killTimer(m_timerId);
++        m_timerId = -1;
++    }
++
++    m_showText = m_plugin->settings()->value(QStringLiteral("showText"), true).toBool();
++    m_widgetWidth = std::clamp(m_plugin->settings()->value(QStringLiteral("widgetWidth"), DefaultWidgetWidth).toInt(),
++                               MinimumWidgetWidth,
++                               MaximumWidgetWidth);
++    m_updateIntervalMs = std::clamp(m_plugin->settings()->value(QStringLiteral("updateInterval"), DefaultUpdateIntervalMs).toInt(),
++                                    MinimumUpdateIntervalMs,
++                                    MaximumUpdateIntervalMs);
++
++    const QString barOrientation = m_plugin->settings()
++        ->value(QStringLiteral("barOrientation"), QStringLiteral("bottomUp"))
++        .toString();
++
++    if (barOrientation == QLatin1String(BarOrientRightLeft))
++        m_barOrientation = RightToLeftBar;
++    else if (barOrientation == QLatin1String(BarOrientLeftRight))
++        m_barOrientation = LeftToRightBar;
++    else if (barOrientation == QLatin1String(BarOrientTopDown))
++        m_barOrientation = TopDownBar;
++    else
++        m_barOrientation = BottomUpBar;
++
++    m_timerId = startTimer(m_updateIntervalMs);
++    setSizes();
++    update();
++}
+diff --git a/plugin-resourcemonitor/lxqtresourcemonitor.h b/plugin-resourcemonitor/lxqtresourcemonitor.h
+new file mode 100644
+index 0000000..f0395a2
+--- /dev/null
++++ b/plugin-resourcemonitor/lxqtresourcemonitor.h
+@@ -0,0 +1,117 @@
++/* BEGIN_COMMON_COPYRIGHT_HEADER
++ * (c)LGPL2+
++ *
++ * LXQt - a lightweight, Qt based, desktop toolset
++ * https://lxqt.org
++ *
++ * This program or library is free software; you can redistribute it
++ * and/or modify it under the terms of the GNU Lesser General Public
++ * License as published by the Free Software Foundation; either
++ * version 2.1 of the License, or (at your option) any later version.
++ *
++ * This library is distributed in the hope that it will be useful,
++ * but WITHOUT ANY WARRANTY; without even the implied warranty of
++ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the GNU
++ * Lesser General Public License for more details.
++ *
++ * END_COMMON_COPYRIGHT_HEADER */
++
++#ifndef LXQTRESOURCEMONITOR_H
++#define LXQTRESOURCEMONITOR_H
++
++#include <QColor>
++#include <QFont>
++#include <QFrame>
++#include <array>
++#include <cstddef>
++
++class ILXQtPanelPlugin;
++class QPaintEvent;
++class QPainter;
++class QResizeEvent;
++class QTimerEvent;
++
++class LXQtResourceMonitor final : public QFrame
++{
++    Q_OBJECT
++    Q_PROPERTY(QColor fontColor READ fontColor WRITE setFontColor)
++
++public:
++    enum BarOrientation
++    {
++        BottomUpBar,
++        TopDownBar,
++        RightToLeftBar,
++        LeftToRightBar
++    };
++
++    explicit LXQtResourceMonitor(ILXQtPanelPlugin *plugin, QWidget *parent = nullptr);
++    ~LXQtResourceMonitor() override;
++
++    void settingsChanged();
++
++    void setFontColor(const QColor &value) { m_fontColor = value; }
++    [[nodiscard]] QColor fontColor() const { return m_fontColor; }
++
++protected:
++    void timerEvent(QTimerEvent *event) override;
++    void paintEvent(QPaintEvent *event) override;
++    void resizeEvent(QResizeEvent *event) override;
++
++private:
++    enum class Resource : std::size_t
++    {
++        Cpu = 0,
++        Memory,
++        Swap,
++        Count
++    };
++
++    struct ResourceSnapshot
++    {
++        double percent{0.0};
++        quint64 usedBytes{0};
++        quint64 totalBytes{0};
++        bool valid{false};
++    };
++
++    static constexpr int DefaultWidgetWidth = 78;
++    static constexpr int MinimumWidgetWidth = 48;
++    static constexpr int MaximumWidgetWidth = 300;
++    static constexpr int DefaultUpdateIntervalMs = 1000;
++    static constexpr int MinimumUpdateIntervalMs = 500;
++    static constexpr int MaximumUpdateIntervalMs = 10000000;
++
++    [[nodiscard]] static constexpr std::size_t resourceIndex(Resource resource)
++    {
++        return static_cast<std::size_t>(resource);
++    }
++
++    [[nodiscard]] bool isVerticalBarOrientation() const;
++    [[nodiscard]] QRect meterRect(std::size_t resourceIndex) const;
++    [[nodiscard]] QRect fillRect(const QRect &meterRectangle, double percent) const;
++    [[nodiscard]] QColor resourceLightColor(Resource resource) const;
++    [[nodiscard]] QColor resourceDarkColor(Resource resource) const;
++    [[nodiscard]] QFont fittedTextFont(const QRect &meterRectangle) const;
++
++    void setSizes();
++    void refreshStats();
++    void updateToolTip();
++    void drawMeter(QPainter &painter, Resource resource, const QRect &meterRectangle);
++
++    ILXQtPanelPlugin *m_plugin;
++    QWidget m_sizingWidget;
++    std::array<ResourceSnapshot, static_cast<std::size_t>(Resource::Count)> m_resources{};
++
++    bool m_showText{true};
++    int m_widgetWidth{DefaultWidgetWidth};
++    BarOrientation m_barOrientation{BottomUpBar};
++    int m_updateIntervalMs{DefaultUpdateIntervalMs};
++    int m_timerId{-1};
++    bool m_statgrabInitialized{false};
++
++    QFont m_font;
++    QColor m_fontColor;
++};
++
++#endif // LXQTRESOURCEMONITOR_H
+diff --git a/plugin-resourcemonitor/lxqtresourcemonitorconfiguration.cpp b/plugin-resourcemonitor/lxqtresourcemonitorconfiguration.cpp
+new file mode 100644
+index 0000000..f228b15
+--- /dev/null
++++ b/plugin-resourcemonitor/lxqtresourcemonitorconfiguration.cpp
+@@ -0,0 +1,114 @@
++/* BEGIN_COMMON_COPYRIGHT_HEADER
++ * (c)LGPL2+
++ *
++ * LXQt - a lightweight, Qt based, desktop toolset
++ * https://lxqt.org
++ *
++ * This program or library is free software; you can redistribute it
++ * and/or modify it under the terms of the GNU Lesser General Public
++ * License as published by the Free Software Foundation; either
++ * version 2.1 of the License, or (at your option) any later version.
++ *
++ * END_COMMON_COPYRIGHT_HEADER */
++
++#include "lxqtresourcemonitorconfiguration.h"
++#include "ui_lxqtresourcemonitorconfiguration.h"
++
++namespace
++{
++constexpr int DefaultWidgetWidth = 78;
++constexpr int DefaultUpdateIntervalMs = 1000;
++} // namespace
++
++LXQtResourceMonitorConfiguration::LXQtResourceMonitorConfiguration(PluginSettings *settings, QWidget *parent)
++    : LXQtPanelPluginConfigDialog(settings, parent)
++    , m_ui(new Ui::LXQtResourceMonitorConfiguration)
++{
++    setAttribute(Qt::WA_DeleteOnClose);
++    setObjectName(QStringLiteral("ResourceMonitorConfigurationWindow"));
++    m_ui->setupUi(this);
++
++    fillBarOrientations();
++
++    connect(m_ui->buttons,
++            &QDialogButtonBox::clicked,
++            this,
++            &LXQtResourceMonitorConfiguration::dialogButtonsAction);
++
++    loadSettings();
++
++    connect(m_ui->showTextCB,
++            &QCheckBox::toggled,
++            this,
++            &LXQtResourceMonitorConfiguration::showTextChanged);
++    connect(m_ui->widgetWidthSB,
++            &QSpinBox::valueChanged,
++            this,
++            &LXQtResourceMonitorConfiguration::widgetWidthChanged);
++    connect(m_ui->updateIntervalSpinBox,
++            &QDoubleSpinBox::valueChanged,
++            this,
++            &LXQtResourceMonitorConfiguration::updateIntervalChanged);
++    connect(m_ui->barOrientationCOB,
++            &QComboBox::currentIndexChanged,
++            this,
++            &LXQtResourceMonitorConfiguration::barOrientationChanged);
++}
++
++LXQtResourceMonitorConfiguration::~LXQtResourceMonitorConfiguration()
++{
++    delete m_ui;
++}
++
++void LXQtResourceMonitorConfiguration::fillBarOrientations()
++{
++    m_ui->barOrientationCOB->addItem(tr("Bottom up"), QStringLiteral("bottomUp"));
++    m_ui->barOrientationCOB->addItem(tr("Top down"), QStringLiteral("topDown"));
++    m_ui->barOrientationCOB->addItem(tr("Left to right"), QStringLiteral("leftRight"));
++    m_ui->barOrientationCOB->addItem(tr("Right to left"), QStringLiteral("rightLeft"));
++}
++
++void LXQtResourceMonitorConfiguration::loadSettings()
++{
++    m_lockSettingChanges = true;
++
++    m_ui->showTextCB->setChecked(settings().value(QStringLiteral("showText"), true).toBool());
++    m_ui->widgetWidthSB->setValue(settings().value(QStringLiteral("widgetWidth"), DefaultWidgetWidth).toInt());
++    m_ui->updateIntervalSpinBox->setValue(
++        settings().value(QStringLiteral("updateInterval"), DefaultUpdateIntervalMs).toInt() / 1000.0);
++
++    int orientationIndex = m_ui->barOrientationCOB->findData(
++        settings().value(QStringLiteral("barOrientation"), QStringLiteral("bottomUp")));
++    if (orientationIndex < 0)
++        orientationIndex = 0;
++    m_ui->barOrientationCOB->setCurrentIndex(orientationIndex);
++
++    m_lockSettingChanges = false;
++}
++
++void LXQtResourceMonitorConfiguration::showTextChanged(bool value)
++{
++    if (!m_lockSettingChanges)
++        settings().setValue(QStringLiteral("showText"), value);
++}
++
++void LXQtResourceMonitorConfiguration::widgetWidthChanged(int value)
++{
++    if (!m_lockSettingChanges)
++        settings().setValue(QStringLiteral("widgetWidth"), value);
++}
++
++void LXQtResourceMonitorConfiguration::updateIntervalChanged(double value)
++{
++    if (!m_lockSettingChanges)
++        settings().setValue(QStringLiteral("updateInterval"), qRound(value * 1000.0));
++}
++
++void LXQtResourceMonitorConfiguration::barOrientationChanged(int index)
++{
++    if (!m_lockSettingChanges && index >= 0)
++    {
++        settings().setValue(QStringLiteral("barOrientation"),
++                            m_ui->barOrientationCOB->itemData(index).toString());
++    }
++}
+diff --git a/plugin-resourcemonitor/lxqtresourcemonitorconfiguration.h b/plugin-resourcemonitor/lxqtresourcemonitorconfiguration.h
+new file mode 100644
+index 0000000..3e15adf
+--- /dev/null
++++ b/plugin-resourcemonitor/lxqtresourcemonitorconfiguration.h
+@@ -0,0 +1,47 @@
++/* BEGIN_COMMON_COPYRIGHT_HEADER
++ * (c)LGPL2+
++ *
++ * LXQt - a lightweight, Qt based, desktop toolset
++ * https://lxqt.org
++ *
++ * This program or library is free software; you can redistribute it
++ * and/or modify it under the terms of the GNU Lesser General Public
++ * License as published by the Free Software Foundation; either
++ * version 2.1 of the License, or (at your option) any later version.
++ *
++ * END_COMMON_COPYRIGHT_HEADER */
++
++#ifndef LXQTRESOURCEMONITORCONFIGURATION_H
++#define LXQTRESOURCEMONITORCONFIGURATION_H
++
++#include "../panel/lxqtpanelpluginconfigdialog.h"
++#include "../panel/pluginsettings.h"
++
++namespace Ui
++{
++class LXQtResourceMonitorConfiguration;
++}
++
++class LXQtResourceMonitorConfiguration final : public LXQtPanelPluginConfigDialog
++{
++    Q_OBJECT
++
++public:
++    explicit LXQtResourceMonitorConfiguration(PluginSettings *settings, QWidget *parent = nullptr);
++    ~LXQtResourceMonitorConfiguration() override;
++
++private slots:
++    void loadSettings() override;
++    void showTextChanged(bool value);
++    void widgetWidthChanged(int value);
++    void updateIntervalChanged(double value);
++    void barOrientationChanged(int index);
++
++private:
++    void fillBarOrientations();
++
++    Ui::LXQtResourceMonitorConfiguration *m_ui;
++    bool m_lockSettingChanges{false};
++};
++
++#endif // LXQTRESOURCEMONITORCONFIGURATION_H
+diff --git a/plugin-resourcemonitor/lxqtresourcemonitorconfiguration.ui b/plugin-resourcemonitor/lxqtresourcemonitorconfiguration.ui
+new file mode 100644
+index 0000000..6aaf553
+--- /dev/null
++++ b/plugin-resourcemonitor/lxqtresourcemonitorconfiguration.ui
+@@ -0,0 +1,138 @@
++<?xml version="1.0" encoding="UTF-8"?>
++<ui version="4.0">
++ <class>LXQtResourceMonitorConfiguration</class>
++ <widget class="QDialog" name="LXQtResourceMonitorConfiguration">
++  <property name="geometry">
++   <rect>
++    <x>0</x>
++    <y>0</y>
++    <width>330</width>
++    <height>225</height>
++   </rect>
++  </property>
++  <property name="windowTitle">
++   <string>Resource Monitor Settings</string>
++  </property>
++  <layout class="QGridLayout" name="gridLayout_2">
++   <item row="0" column="0">
++    <widget class="QGroupBox" name="generalGB">
++     <property name="title">
++      <string>General</string>
++     </property>
++     <layout class="QGridLayout" name="gridLayout">
++      <item row="0" column="0" colspan="2">
++       <widget class="QCheckBox" name="showTextCB">
++        <property name="text">
++         <string>Show percentages</string>
++        </property>
++        <property name="checked">
++         <bool>true</bool>
++        </property>
++       </widget>
++      </item>
++      <item row="1" column="0">
++       <widget class="QLabel" name="updateIntervalLabel">
++        <property name="text">
++         <string>Update interval:</string>
++        </property>
++       </widget>
++      </item>
++      <item row="1" column="1">
++       <widget class="QDoubleSpinBox" name="updateIntervalSpinBox">
++        <property name="suffix">
++         <string> sec</string>
++        </property>
++        <property name="decimals">
++         <number>1</number>
++        </property>
++        <property name="minimum">
++         <double>0.500000000000000</double>
++        </property>
++        <property name="maximum">
++         <double>10000.000000000000000</double>
++        </property>
++        <property name="singleStep">
++         <double>0.500000000000000</double>
++        </property>
++        <property name="value">
++         <double>1.000000000000000</double>
++        </property>
++       </widget>
++      </item>
++      <item row="2" column="0">
++       <widget class="QLabel" name="barOrientationLabel">
++        <property name="text">
++         <string>Bar orientation:</string>
++        </property>
++       </widget>
++      </item>
++      <item row="2" column="1">
++       <widget class="QComboBox" name="barOrientationCOB"/>
++      </item>
++      <item row="3" column="0">
++       <widget class="QLabel" name="widgetWidthLabel">
++        <property name="text">
++         <string>Widget width:</string>
++        </property>
++       </widget>
++      </item>
++      <item row="3" column="1">
++       <widget class="QSpinBox" name="widgetWidthSB">
++        <property name="suffix">
++         <string> px</string>
++        </property>
++        <property name="minimum">
++         <number>48</number>
++        </property>
++        <property name="maximum">
++         <number>300</number>
++        </property>
++        <property name="singleStep">
++         <number>1</number>
++        </property>
++        <property name="value">
++         <number>78</number>
++        </property>
++       </widget>
++      </item>
++      <item row="4" column="0" colspan="2">
++       <widget class="QLabel" name="colorHintLabel">
++        <property name="text">
++         <string>CPU: green   RAM: blue   SWAP: amber</string>
++        </property>
++        <property name="alignment">
++         <set>Qt::AlignCenter</set>
++        </property>
++       </widget>
++      </item>
++     </layout>
++    </widget>
++   </item>
++   <item row="1" column="0">
++    <spacer name="verticalSpacer">
++     <property name="orientation">
++      <enum>Qt::Vertical</enum>
++     </property>
++     <property name="sizeHint" stdset="0">
++      <size>
++       <width>20</width>
++       <height>20</height>
++      </size>
++     </property>
++    </spacer>
++   </item>
++   <item row="2" column="0">
++    <widget class="QDialogButtonBox" name="buttons">
++     <property name="orientation">
++      <enum>Qt::Horizontal</enum>
++     </property>
++     <property name="standardButtons">
++      <set>QDialogButtonBox::Close|QDialogButtonBox::Reset</set>
++     </property>
++    </widget>
++   </item>
++  </layout>
++ </widget>
++ <resources/>
++ <connections/>
++</ui>
+diff --git a/plugin-resourcemonitor/lxqtresourcemonitorplugin.cpp b/plugin-resourcemonitor/lxqtresourcemonitorplugin.cpp
+new file mode 100644
+index 0000000..34c3623
+--- /dev/null
++++ b/plugin-resourcemonitor/lxqtresourcemonitorplugin.cpp
+@@ -0,0 +1,52 @@
++/* BEGIN_COMMON_COPYRIGHT_HEADER
++ * (c)LGPL2+
++ *
++ * LXQt - a lightweight, Qt based, desktop toolset
++ * https://lxqt.org
++ *
++ * This program or library is free software; you can redistribute it
++ * and/or modify it under the terms of the GNU Lesser General Public
++ * License as published by the Free Software Foundation; either
++ * version 2.1 of the License, or (at your option) any later version.
++ *
++ * END_COMMON_COPYRIGHT_HEADER */
++
++#include "lxqtresourcemonitorplugin.h"
++
++#include "lxqtresourcemonitor.h"
++#include "lxqtresourcemonitorconfiguration.h"
++
++#include <QVBoxLayout>
++#include <QWidget>
++
++LXQtResourceMonitorPlugin::LXQtResourceMonitorPlugin(const ILXQtPanelPluginStartupInfo &startupInfo)
++    : QObject()
++    , ILXQtPanelPlugin(startupInfo)
++    , m_widget(std::make_unique<QWidget>())
++{
++    m_content = new LXQtResourceMonitor(this, m_widget.get());
++
++    auto *layout = new QVBoxLayout(m_widget.get());
++    layout->setContentsMargins(0, 0, 0, 0);
++    layout->setSpacing(0);
++    layout->addWidget(m_content);
++    layout->setStretchFactor(m_content, 1);
++}
++
++LXQtResourceMonitorPlugin::~LXQtResourceMonitorPlugin() = default;
++
++QWidget *LXQtResourceMonitorPlugin::widget()
++{
++    return m_widget.get();
++}
++
++QDialog *LXQtResourceMonitorPlugin::configureDialog()
++{
++    return new LXQtResourceMonitorConfiguration(settings());
++}
++
++void LXQtResourceMonitorPlugin::settingsChanged()
++{
++    if (m_content != nullptr)
++        m_content->settingsChanged();
++}
+diff --git a/plugin-resourcemonitor/lxqtresourcemonitorplugin.h b/plugin-resourcemonitor/lxqtresourcemonitorplugin.h
+new file mode 100644
+index 0000000..f270861
+--- /dev/null
++++ b/plugin-resourcemonitor/lxqtresourcemonitorplugin.h
+@@ -0,0 +1,64 @@
++/* BEGIN_COMMON_COPYRIGHT_HEADER
++ * (c)LGPL2+
++ *
++ * LXQt - a lightweight, Qt based, desktop toolset
++ * https://lxqt.org
++ *
++ * This program or library is free software; you can redistribute it
++ * and/or modify it under the terms of the GNU Lesser General Public
++ * License as published by the Free Software Foundation; either
++ * version 2.1 of the License, or (at your option) any later version.
++ *
++ * END_COMMON_COPYRIGHT_HEADER */
++
++#ifndef LXQTRESOURCEMONITORPLUGIN_H
++#define LXQTRESOURCEMONITORPLUGIN_H
++
++#include "../panel/ilxqtpanelplugin.h"
++
++#include <QObject>
++
++#include <memory>
++
++class LXQtResourceMonitor;
++
++class LXQtResourceMonitorPlugin final : public QObject, public ILXQtPanelPlugin
++{
++    Q_OBJECT
++
++public:
++    explicit LXQtResourceMonitorPlugin(const ILXQtPanelPluginStartupInfo &startupInfo);
++    ~LXQtResourceMonitorPlugin() override;
++
++    [[nodiscard]] ILXQtPanelPlugin::Flags flags() const override
++    {
++        return PreferRightAlignment | HaveConfigDialog;
++    }
++
++    [[nodiscard]] QWidget *widget() override;
++    [[nodiscard]] QString themeId() const override { return QStringLiteral("ResourceMonitor"); }
++    [[nodiscard]] bool isSeparate() const override { return true; }
++    [[nodiscard]] QDialog *configureDialog() override;
++
++protected:
++    void settingsChanged() override;
++
++private:
++    std::unique_ptr<QWidget> m_widget;
++    LXQtResourceMonitor *m_content{nullptr}; // QObject parent owns this child widget.
++};
++
++class LXQtResourceMonitorPluginLibrary final : public QObject, public ILXQtPanelPluginLibrary
++{
++    Q_OBJECT
++    Q_PLUGIN_METADATA(IID "lxqt.org/Panel/PluginInterface/3.0")
++    Q_INTERFACES(ILXQtPanelPluginLibrary)
++
++public:
++    [[nodiscard]] ILXQtPanelPlugin *instance(const ILXQtPanelPluginStartupInfo &startupInfo) const override
++    {
++        return new LXQtResourceMonitorPlugin(startupInfo);
++    }
++};
++
++#endif // LXQTRESOURCEMONITORPLUGIN_H
+diff --git a/plugin-resourcemonitor/resourcemonitormath.cpp b/plugin-resourcemonitor/resourcemonitormath.cpp
+new file mode 100644
+index 0000000..64f40f9
+--- /dev/null
++++ b/plugin-resourcemonitor/resourcemonitormath.cpp
+@@ -0,0 +1,46 @@
++/* BEGIN_COMMON_COPYRIGHT_HEADER
++ * (c)LGPL2+
++ *
++ * LXQt - a lightweight, Qt based, desktop toolset
++ * https://lxqt.org
++ *
++ * This program or library is free software; you can redistribute it
++ * and/or modify it under the terms of the GNU Lesser General Public
++ * License as published by the Free Software Foundation; either
++ * version 2.1 of the License, or (at your option) any later version.
++ *
++ * END_COMMON_COPYRIGHT_HEADER */
++
++#include "resourcemonitormath.h"
++
++#include <algorithm>
++
++namespace ResourceMonitorMath
++{
++double calculatePercent(quint64 used, quint64 total)
++{
++    if (total == 0)
++        return 0.0;
++
++    return std::clamp((static_cast<double>(used) * 100.0) / static_cast<double>(total), 0.0, 100.0);
++}
++
++QString formatBytes(quint64 bytes)
++{
++    constexpr double Kibibyte = 1024.0;
++    constexpr double Mebibyte = Kibibyte * 1024.0;
++    constexpr double Gibibyte = Mebibyte * 1024.0;
++    constexpr double Tebibyte = Gibibyte * 1024.0;
++
++    const double byteValue = static_cast<double>(bytes);
++    if (byteValue >= Tebibyte)
++        return QStringLiteral("%1 TiB").arg(byteValue / Tebibyte, 0, 'f', 1);
++    if (byteValue >= Gibibyte)
++        return QStringLiteral("%1 GiB").arg(byteValue / Gibibyte, 0, 'f', 1);
++    if (byteValue >= Mebibyte)
++        return QStringLiteral("%1 MiB").arg(byteValue / Mebibyte, 0, 'f', 1);
++    if (byteValue >= Kibibyte)
++        return QStringLiteral("%1 KiB").arg(byteValue / Kibibyte, 0, 'f', 1);
++    return QStringLiteral("%1 B").arg(bytes);
++}
++} // namespace ResourceMonitorMath
+diff --git a/plugin-resourcemonitor/resourcemonitormath.h b/plugin-resourcemonitor/resourcemonitormath.h
+new file mode 100644
+index 0000000..07decaa
+--- /dev/null
++++ b/plugin-resourcemonitor/resourcemonitormath.h
+@@ -0,0 +1,27 @@
++/* BEGIN_COMMON_COPYRIGHT_HEADER
++ * (c)LGPL2+
++ *
++ * LXQt - a lightweight, Qt based, desktop toolset
++ * https://lxqt.org
++ *
++ * This program or library is free software; you can redistribute it
++ * and/or modify it under the terms of the GNU Lesser General Public
++ * License as published by the Free Software Foundation; either
++ * version 2.1 of the License, or (at your option) any later version.
++ *
++ * END_COMMON_COPYRIGHT_HEADER */
++
++#ifndef LXQTRESOURCEMONITORMATH_H
++#define LXQTRESOURCEMONITORMATH_H
++
++#include <QString>
++
++#include <QtGlobal>
++
++namespace ResourceMonitorMath
++{
++[[nodiscard]] double calculatePercent(quint64 used, quint64 total);
++[[nodiscard]] QString formatBytes(quint64 bytes);
++} // namespace ResourceMonitorMath
++
++#endif // LXQTRESOURCEMONITORMATH_H
+diff --git a/plugin-resourcemonitor/resources/resourcemonitor.desktop.in b/plugin-resourcemonitor/resources/resourcemonitor.desktop.in
+new file mode 100644
+index 0000000..45cf5a4
+--- /dev/null
++++ b/plugin-resourcemonitor/resources/resourcemonitor.desktop.in
+@@ -0,0 +1,6 @@
++[Desktop Entry]
++Type=Service
++ServiceTypes=LXQtPanel/Plugin
++Icon=utilities-system-monitor
++
++#TRANSLATIONS_DIR=../translations
+diff --git a/plugin-resourcemonitor/translations/resourcemonitor.desktop.yaml b/plugin-resourcemonitor/translations/resourcemonitor.desktop.yaml
+new file mode 100644
+index 0000000..4e24f77
+--- /dev/null
++++ b/plugin-resourcemonitor/translations/resourcemonitor.desktop.yaml
+@@ -0,0 +1,2 @@
++Desktop Entry/Name: "Resource Monitor"
++Desktop Entry/Comment: "Displays CPU, RAM and swap usage"
+diff --git a/plugin-resourcemonitor/translations/resourcemonitor.ts b/plugin-resourcemonitor/translations/resourcemonitor.ts
+new file mode 100644
+index 0000000..6401616
+--- /dev/null
++++ b/plugin-resourcemonitor/translations/resourcemonitor.ts
+@@ -0,0 +1,4 @@
++<?xml version="1.0" encoding="utf-8"?>
++<!DOCTYPE TS>
++<TS version="2.1">
++</TS>

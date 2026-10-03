@@ -2,14 +2,17 @@
 
 Resource Monitor is a dynamically loaded **LXQt Panel 2.3.2** plugin for Lubuntu 26.04. It displays selected system and I/O meters together in one panel item, styled after LXQt's CPU Monitor.
 
+The commands below assume you have already cloned this repository and are running them from its `lxqt-resource-monitor/` folder.
+
 ## Appearance and defaults
 
 - Optional meters for CPU, RAM, SWAP, local disk I/O, local network I/O and Internet I/O. CPU, RAM and SWAP are selected by default.
 - Bottom-up vertical bars by default; top-down, left-to-right and right-to-left are configurable.
+- Each meter shows up to 19 seconds of EMA-smoothed history sampled once per second. The number over the chart remains the latest live value.
 - CPU is green, RAM blue, SWAP amber, disk purple, local network teal and Internet red. The colored outlines remain visible at 0%, so the meters are identifiable without labels.
 - Rounded usage values are shown over the bars without a `%` postfix; tooltips retain percentages.
 - Default width is **57 px for three selected resources**, giving each bar 19 px. The widget grows or shrinks with the number of selected resources, keeping each bar the same width. The setting is configurable live from 48 to 300 px for three resources.
-- Sampling interval defaults to one second and is configurable from 0.5 seconds.
+- The widget repaint interval defaults to one second and is configurable from 0.5 seconds; history sampling stays at one second regardless of that setting.
 - The tooltip shows percentages, used/total RAM and SWAP values, and read/write rates for enabled I/O meters.
 - Network traffic is classified by its remote IP address: private/local IP traffic appears under Local net; public IP traffic appears under Internet. The optional `resourcemonitor-netcap` helper reads IP headers only and does not save addresses or packet contents. Network sampling requires this helper to be installed as a root-owned executable with `CAP_NET_RAW`; the helper drops that capability after opening its packet socket.
 - If swap is not configured, its meter is empty and the tooltip says `SWAP: not configured`.
@@ -29,7 +32,7 @@ ctest --test-dir build --output-on-failure
 
 ## Build the LXQt Panel plugin
 
-The plugin uses the same private panel interfaces as the bundled LXQt plugins, so build it in an LXQt Panel 2.3.2 source tree. The included patch adds the plugin to the upstream CMake build and install lists.
+The plugin uses the same private panel interfaces as the bundled LXQt plugins, so build it against an LXQt Panel 2.3.2 source tree. The included patch adds the plugin to the upstream CMake build and install lists. Run all commands below from the `lxqt-resource-monitor/` folder.
 
 Install the build dependencies using Ubuntu's package metadata:
 
@@ -44,19 +47,18 @@ If `apt build-dep` prints `You must put some 'deb-src' URIs in your sources.list
 Apply the patch to a clean upstream checkout:
 
 ```bash
-git clone --depth 1 --branch 2.3.2 https://github.com/lxqt/lxqt-panel.git
-cd lxqt-panel
-git apply /path/to/lxqt-panel-2.3.2-resourcemonitor.patch
+git clone --depth 1 --branch 2.3.2 https://github.com/lxqt/lxqt-panel.git lxqt-panel-2.3.2
+git -C lxqt-panel-2.3.2 apply "$PWD/lxqt-panel-2.3.2-resourcemonitor.patch"
 ```
 
 Configure and build just the new plugin:
 
 ```bash
-cmake -S . -B build -G Ninja -DCMAKE_BUILD_TYPE=RelWithDebInfo
-cmake --build build --target resourcemonitor resourcemonitor-netcap
+cmake -S lxqt-panel-2.3.2 -B lxqt-panel-2.3.2/build -G Ninja -DCMAKE_BUILD_TYPE=RelWithDebInfo
+cmake --build lxqt-panel-2.3.2/build --target resourcemonitor resourcemonitor-netcap
 ```
 
-The resulting files include `build/plugin-resourcemonitor/libresourcemonitor.so`, `build/plugin-resourcemonitor/resourcemonitor.desktop` and `build/plugin-resourcemonitor/resourcemonitor-netcap`.
+The resulting files are in `lxqt-panel-2.3.2/build/plugin-resourcemonitor/`.
 
 ## Build a binary Debian package
 
@@ -64,18 +66,24 @@ You can compile on one computer and install a binary `.deb` on another. The targ
 
 ```bash
 ./packaging/build-deb.sh \
-    /path/to/lxqt-panel/build/plugin-resourcemonitor \
-    1.0.0-1 \
+    lxqt-panel-2.3.2/build/plugin-resourcemonitor \
+    1.0.4-1 \
     build/packages
 ```
 
-The script packages the plugin, desktop entry and capture helper; it also records the build computer's exact `lxqt-panel` package version and detects shared-library dependencies. It creates a package such as `build/packages/lxqt-resource-monitor_1.0.0-1_amd64.deb` (the architecture suffix varies). Copy that `.deb` to the other computer and install it with APT so missing runtime dependencies are fetched:
+The script packages the plugin, desktop entry and capture helper; it also records the build computer's exact `lxqt-panel` package version and detects shared-library dependencies. It creates `build/packages/lxqt-resource-monitor_1.0.4-1_<architecture>.deb`. Copy that `.deb` to the other computer and install it with APT so missing runtime dependencies are fetched:
 
 ```bash
-sudo apt install ./lxqt-resource-monitor_1.0.0-1_amd64.deb
+sudo apt install ./build/packages/lxqt-resource-monitor_1.0.4-1_$(dpkg --print-architecture).deb
 ```
 
 The `.deb` is architecture and Ubuntu-release specific. Build and install it on computers with the same CPU architecture, Ubuntu/Lubuntu release and exact `lxqt-panel` package version; the plugin uses LXQt Panel's private plugin interface. The package's post-install step gives only `resourcemonitor-netcap` the `CAP_NET_RAW` capability needed for IP-based local-versus-public traffic counts. No source-package repositories are needed on the target computer. After installation, restart LXQt Panel and add **Resource Monitor** in **Panel Settings → Widgets**. To remove the package, run `sudo apt remove lxqt-resource-monitor`.
+
+You can also download the prebuilt `.deb` for the supported amd64 system from the [latest GitHub release](https://github.com/k1moradi/lxqt-resource-monitor/releases/latest). Install the downloaded package with:
+
+```bash
+sudo apt install ./lxqt-resource-monitor_1.0.4-1_amd64.deb
+```
 
 ## Install for all users
 
@@ -84,13 +92,13 @@ Install the plugin module and desktop metadata into LXQt's plugin paths. This le
 ```bash
 MULTIARCH="$(dpkg-architecture -qDEB_HOST_MULTIARCH)"
 sudo install -Dm755 \
-    build/plugin-resourcemonitor/libresourcemonitor.so \
+    lxqt-panel-2.3.2/build/plugin-resourcemonitor/libresourcemonitor.so \
     "/usr/lib/${MULTIARCH}/lxqt-panel/libresourcemonitor.so"
 sudo install -Dm644 \
-    build/plugin-resourcemonitor/resourcemonitor.desktop \
+    lxqt-panel-2.3.2/build/plugin-resourcemonitor/resourcemonitor.desktop \
     /usr/share/lxqt/lxqt-panel/resourcemonitor.desktop
 sudo install -Dm755 \
-    build/plugin-resourcemonitor/resourcemonitor-netcap \
+    lxqt-panel-2.3.2/build/plugin-resourcemonitor/resourcemonitor-netcap \
     /usr/bin/resourcemonitor-netcap
 sudo chown root:root /usr/bin/resourcemonitor-netcap
 sudo setcap cap_net_raw=ep /usr/bin/resourcemonitor-netcap

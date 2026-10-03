@@ -58,6 +58,12 @@ constexpr int TextHorizontalPadding = 0;
 constexpr int PreferredTextPixelSize = 10;
 constexpr int MinimumTextPixelSize = 7;
 
+// The one-second history sampler uses a five-second EMA time constant.
+// Cache both weights so no exponential calculation is needed in the sample
+// loop, and reuse the same weights for every resource and history column.
+constexpr double EmaInputWeight = 0.18126924692201818;
+constexpr double EmaRetainedWeight = 0.8187307530779818;
+
 } // namespace
 
 LXQtResourceMonitor::LXQtResourceMonitor(ILXQtPanelPlugin *plugin, QWidget *parent)
@@ -113,14 +119,18 @@ LXQtResourceMonitor::LXQtResourceMonitor(ILXQtPanelPlugin *plugin, QWidget *pare
                 update();
             });
 
+    m_historyTimerId = startTimer(HistorySampleIntervalMs, Qt::PreciseTimer);
     settingsChanged();
     refreshStats();
+    update();
 }
 
 LXQtResourceMonitor::~LXQtResourceMonitor()
 {
     if (m_timerId != -1)
         killTimer(m_timerId);
+    if (m_historyTimerId != -1)
+        killTimer(m_historyTimerId);
 
     if (m_netCaptureProcess.state() != QProcess::NotRunning)
     {
@@ -200,55 +210,6 @@ QRect LXQtResourceMonitor::meterRect(int meterIndex, int meterCount) const
 
     const int height = baseHeight + (meterIndex < remainder ? 1 : 0);
     return QRect(availableRectangle.left(), y, availableRectangle.width(), height);
-}
-
-QRect LXQtResourceMonitor::fillRect(const QRect &meterRectangle, double percent) const
-{
-    if (meterRectangle.isEmpty())
-        return {};
-
-    const QRect innerRectangle = meterRectangle.adjusted(MeterInnerMargin,
-                                                          MeterInnerMargin,
-                                                          -MeterInnerMargin,
-                                                          -MeterInnerMargin);
-    if (innerRectangle.isEmpty())
-        return {};
-
-    const double boundedPercent = std::clamp(percent, 0.0, 100.0);
-    const double fraction = boundedPercent / 100.0;
-
-    if (isVerticalBarOrientation())
-    {
-        const int filledHeight = std::clamp(static_cast<int>(std::lround(innerRectangle.height() * fraction)),
-                                            0,
-                                            innerRectangle.height());
-        if (filledHeight == 0)
-            return {};
-
-        if (m_barOrientation == TopDownBar)
-            return QRect(innerRectangle.left(), innerRectangle.top(), innerRectangle.width(), filledHeight);
-
-        return QRect(innerRectangle.left(),
-                     innerRectangle.bottom() - filledHeight + 1,
-                     innerRectangle.width(),
-                     filledHeight);
-    }
-
-    const int filledWidth = std::clamp(static_cast<int>(std::lround(innerRectangle.width() * fraction)),
-                                       0,
-                                       innerRectangle.width());
-    if (filledWidth == 0)
-        return {};
-
-    if (m_barOrientation == RightToLeftBar)
-    {
-        return QRect(innerRectangle.right() - filledWidth + 1,
-                     innerRectangle.top(),
-                     filledWidth,
-                     innerRectangle.height());
-    }
-
-    return QRect(innerRectangle.left(), innerRectangle.top(), filledWidth, innerRectangle.height());
 }
 
 QColor LXQtResourceMonitor::resourceLightColor(Resource resource) const
@@ -332,20 +293,97 @@ void LXQtResourceMonitor::drawMeter(QPainter &painter,
     painter.drawRect(meterRectangle.adjusted(0, 0, -1, -1));
 
     const ResourceSnapshot &snapshot = m_resources[resourceIndex(resource)];
-    const QRect filledRectangle = fillRect(meterRectangle, snapshot.valid ? snapshot.percent : 0.0);
-    if (!filledRectangle.isEmpty())
+    const QRect innerRectangle = meterRectangle.adjusted(MeterInnerMargin,
+                                                          MeterInnerMargin,
+                                                          -MeterInnerMargin,
+                                                          -MeterInnerMargin);
+    if (snapshot.valid && snapshot.historySampleCount > 0 && !innerRectangle.isEmpty())
     {
-        QLinearGradient gradient;
-        if (isVerticalBarOrientation())
-            gradient = QLinearGradient(filledRectangle.left(), 0, filledRectangle.right(), 0);
-        else
-            gradient = QLinearGradient(0, filledRectangle.top(), 0, filledRectangle.bottom());
-
+        // The default meter is 19 px wide; map its horizontal pixel columns
+        // across the most recent 19 one-second EMA samples.
+        QLinearGradient gradient(innerRectangle.left(), 0, innerRectangle.right(), 0);
         gradient.setSpread(QLinearGradient::ReflectSpread);
         gradient.setColorAt(0.0, lightColor);
         gradient.setColorAt(0.5, darkColor);
         gradient.setColorAt(1.0, lightColor);
-        painter.fillRect(filledRectangle, gradient);
+        const double historyFillRatio = static_cast<double>(snapshot.historySampleCount)
+            / static_cast<double>(HistorySampleCount);
+
+        const auto valueAtPosition = [&snapshot](double position) {
+            const double boundedPosition = std::clamp(position,
+                                                       0.0,
+                                                       static_cast<double>(HistorySampleCount - 1));
+            const std::size_t firstIndex = static_cast<std::size_t>(boundedPosition);
+            const std::size_t secondIndex = std::min(firstIndex + 1, HistorySampleCount - 1);
+            const double fraction = boundedPosition - static_cast<double>(firstIndex);
+            return snapshot.history[firstIndex]
+                + (snapshot.history[secondIndex] - snapshot.history[firstIndex]) * fraction;
+        };
+
+        if (isVerticalBarOrientation())
+        {
+            const int columnCount = std::max(
+                1,
+                static_cast<int>(std::lround(innerRectangle.width() * historyFillRatio)));
+            const int firstColumn = innerRectangle.right() - columnCount + 1;
+            const std::size_t firstSample = HistorySampleCount - snapshot.historySampleCount;
+            for (int column = 0; column < columnCount; ++column)
+            {
+                const double historyPosition = columnCount > 1
+                    ? static_cast<double>(firstSample) + static_cast<double>(column)
+                          * static_cast<double>(HistorySampleCount - 1 - firstSample)
+                          / static_cast<double>(columnCount - 1)
+                    : HistorySampleCount - 1;
+                const int filledHeight = std::clamp(
+                    static_cast<int>(std::lround(innerRectangle.height()
+                                                 * valueAtPosition(historyPosition) / 100.0)),
+                    0,
+                    innerRectangle.height());
+                if (filledHeight == 0)
+                    continue;
+
+                const int y = m_barOrientation == TopDownBar
+                    ? innerRectangle.top()
+                    : innerRectangle.bottom() - filledHeight + 1;
+                painter.fillRect(QRect(firstColumn + column,
+                                       y,
+                                       1,
+                                       filledHeight),
+                                 gradient);
+            }
+        }
+        else
+        {
+            const int rowCount = std::max(
+                1,
+                static_cast<int>(std::lround(innerRectangle.height() * historyFillRatio)));
+            const int firstRow = innerRectangle.bottom() - rowCount + 1;
+            const std::size_t firstSample = HistorySampleCount - snapshot.historySampleCount;
+            for (int row = 0; row < rowCount; ++row)
+            {
+                const double historyPosition = rowCount > 1
+                    ? static_cast<double>(firstSample) + static_cast<double>(row)
+                          * static_cast<double>(HistorySampleCount - 1 - firstSample)
+                          / static_cast<double>(rowCount - 1)
+                    : HistorySampleCount - 1;
+                const int filledWidth = std::clamp(
+                    static_cast<int>(std::lround(innerRectangle.width()
+                                                 * valueAtPosition(historyPosition) / 100.0)),
+                    0,
+                    innerRectangle.width());
+                if (filledWidth == 0)
+                    continue;
+
+                const int x = m_barOrientation == RightToLeftBar
+                    ? innerRectangle.right() - filledWidth + 1
+                    : innerRectangle.left();
+                painter.fillRect(QRect(x,
+                                       firstRow + row,
+                                       filledWidth,
+                                       1),
+                                 gradient);
+            }
+        }
     }
 
     if (!m_showText)
@@ -488,8 +526,40 @@ void LXQtResourceMonitor::refreshStats()
     }
     m_pendingNetworkBytes = {};
 
+    updateHistory();
     updateToolTip();
-    update();
+}
+
+void LXQtResourceMonitor::updateHistory()
+{
+    for (ResourceSnapshot &snapshot : m_resources)
+    {
+        if (!snapshot.valid)
+        {
+            snapshot.emaPercent = 0.0;
+            snapshot.history.fill(0.0);
+            snapshot.historySampleCount = 0;
+            continue;
+        }
+
+        const double currentPercent = std::clamp(snapshot.percent, 0.0, 100.0);
+        if (snapshot.historySampleCount == 0)
+        {
+            snapshot.emaPercent = currentPercent;
+            snapshot.history.back() = currentPercent;
+            snapshot.historySampleCount = 1;
+        }
+        else
+        {
+            snapshot.emaPercent = snapshot.emaPercent * EmaRetainedWeight
+                + currentPercent * EmaInputWeight;
+            for (std::size_t index = 1; index < HistorySampleCount; ++index)
+                snapshot.history[index - 1] = snapshot.history[index];
+            snapshot.history.back() = snapshot.emaPercent;
+            snapshot.historySampleCount = std::min(snapshot.historySampleCount + 1,
+                                                   HistorySampleCount);
+        }
+    }
 }
 
 void LXQtResourceMonitor::configureNetworkCapture()
@@ -692,13 +762,19 @@ void LXQtResourceMonitor::updateToolTip()
 
 void LXQtResourceMonitor::timerEvent(QTimerEvent *event)
 {
-    if (event->timerId() != m_timerId)
+    if (event->timerId() == m_historyTimerId)
     {
-        QFrame::timerEvent(event);
+        refreshStats();
         return;
     }
 
-    refreshStats();
+    if (event->timerId() == m_timerId)
+    {
+        update();
+        return;
+    }
+
+    QFrame::timerEvent(event);
 }
 
 void LXQtResourceMonitor::settingsChanged()

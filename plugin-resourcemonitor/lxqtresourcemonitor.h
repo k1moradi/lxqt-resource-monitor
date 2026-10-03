@@ -73,14 +73,19 @@ private:
         Count
     };
 
+    static constexpr std::size_t HistorySampleCount = 19;
+
     struct ResourceSnapshot
     {
         double percent{0.0};
+        double emaPercent{0.0};
         quint64 usedBytes{0};
         quint64 totalBytes{0};
         quint64 readBytesPerSecond{0};
         quint64 writeBytesPerSecond{0};
         bool valid{false};
+        std::size_t historySampleCount{0};
+        std::array<double, HistorySampleCount> history{};
     };
 
     static constexpr std::size_t ResourceCount = static_cast<std::size_t>(Resource::Count);
@@ -88,6 +93,7 @@ private:
     static constexpr int MinimumWidgetWidth = 48;
     static constexpr int MaximumWidgetWidth = 300;
     static constexpr int DefaultUpdateIntervalMs = 1000;
+    static constexpr int HistorySampleIntervalMs = 1000;
     static constexpr int MinimumUpdateIntervalMs = 500;
     static constexpr int MaximumUpdateIntervalMs = 10000000;
 
@@ -100,7 +106,6 @@ private:
     [[nodiscard]] int enabledResourceCount() const;
     [[nodiscard]] bool isVerticalBarOrientation() const;
     [[nodiscard]] QRect meterRect(int meterIndex, int meterCount) const;
-    [[nodiscard]] QRect fillRect(const QRect &meterRectangle, double percent) const;
     [[nodiscard]] QColor resourceLightColor(Resource resource) const;
     [[nodiscard]] QColor resourceDarkColor(Resource resource) const;
     [[nodiscard]] QFont fittedTextFont(const QRect &meterRectangle) const;
@@ -109,6 +114,7 @@ private:
     void configureNetworkCapture();
     void readNetworkCaptureOutput();
     void refreshStats();
+    void updateHistory();
     void updateIoSnapshot(Resource resource,
                           quint64 readBytes,
                           quint64 writeBytes,
@@ -125,6 +131,7 @@ private:
     BarOrientation m_barOrientation{BottomUpBar};
     int m_updateIntervalMs{DefaultUpdateIntervalMs};
     int m_timerId{-1};
+    int m_historyTimerId{-1};
     bool m_statgrabInitialized{false};
     std::array<bool, ResourceCount> m_enabledResources{true, true, true, false, false, false};
     std::array<double, 3> m_ioPeakBytesPerSecond{};

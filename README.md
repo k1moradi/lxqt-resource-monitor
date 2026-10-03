@@ -7,7 +7,7 @@ Resource Monitor is a dynamically loaded **LXQt Panel 2.3.2** plugin for Lubuntu
 - Three adjacent meters, ordered CPU, RAM, SWAP.
 - Bottom-up vertical bars by default; top-down, left-to-right and right-to-left are configurable.
 - CPU is green, RAM blue and SWAP amber. The colored outlines remain visible at 0%, so the meters are identifiable without labels.
-- Percentages are shown by default.
+- Rounded usage values are shown over the bars without a `%` postfix; tooltips retain percentages.
 - Default total width is **78 px**, configurable live from 48 to 300 px.
 - Sampling interval defaults to one second and is configurable from 0.5 seconds.
 - The tooltip shows percentages and used/total RAM and SWAP values.
@@ -83,7 +83,7 @@ sudo rm -f /usr/share/lxqt/lxqt-panel/resourcemonitor.desktop
 
 ## First visual check
 
-Try the default **78 px** width and check whether `100%` fits comfortably at your panel height. The width can be changed immediately in the settings dialog. Feedback on the preferred default width and how the three colors look with the active theme can guide a follow-up adjustment.
+Try the default **78 px** width and check whether the three-digit `100` fits comfortably at your panel height. The width can be changed immediately in the settings dialog. Feedback on the preferred default width and how the three colors look with the active theme can guide a follow-up adjustment.
 
 ## License
 

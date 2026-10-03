@@ -242,7 +242,7 @@ QColor LXQtResourceMonitor::resourceDarkColor(Resource resource) const
 QFont LXQtResourceMonitor::fittedTextFont(const QRect &meterRectangle) const
 {
     QFont font = m_font;
-    const QString widestText = QStringLiteral("100%");
+    const QString widestText = QStringLiteral("100");
     const int availableWidth = std::max(1, meterRectangle.width() - 2 * TextHorizontalPadding);
     const int availableHeight = std::max(1, meterRectangle.height() - 2);
 
@@ -299,7 +299,7 @@ void LXQtResourceMonitor::drawMeter(QPainter &painter,
     painter.setPen(m_fontColor.isValid() ? m_fontColor : palette().color(QPalette::WindowText));
 
     const QString text = snapshot.valid
-        ? QStringLiteral("%1%").arg(qRound(snapshot.percent))
+        ? QStringLiteral("%1").arg(qRound(snapshot.percent))
         : QStringLiteral("--");
     painter.drawText(meterRectangle, Qt::AlignCenter, text);
 }

@@ -73,19 +73,18 @@ private:
         Count
     };
 
-    static constexpr std::size_t HistorySampleCount = 19;
+    static constexpr std::size_t HistoryColumnCount = 19;
 
     struct ResourceSnapshot
     {
         double percent{0.0};
-        double emaPercent{0.0};
         quint64 usedBytes{0};
         quint64 totalBytes{0};
         quint64 readBytesPerSecond{0};
         quint64 writeBytesPerSecond{0};
         bool valid{false};
-        std::size_t historySampleCount{0};
-        std::array<double, HistorySampleCount> history{};
+        bool historyInitialized{false};
+        std::array<double, HistoryColumnCount> history{};
     };
 
     static constexpr std::size_t ResourceCount = static_cast<std::size_t>(Resource::Count);

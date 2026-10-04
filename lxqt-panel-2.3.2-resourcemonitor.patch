@@ -56,10 +56,10 @@ index 0000000..2ca7935
 +install(TARGETS resourcemonitor-netcap RUNTIME DESTINATION bin)
 diff --git a/plugin-resourcemonitor/lxqtresourcemonitor.cpp b/plugin-resourcemonitor/lxqtresourcemonitor.cpp
 new file mode 100644
-index 0000000..8e4b5a9
+index 0000000..d38e71e
 --- /dev/null
 +++ b/plugin-resourcemonitor/lxqtresourcemonitor.cpp
-@@ -0,0 +1,749 @@
+@@ -0,0 +1,768 @@
 +/* BEGIN_COMMON_COPYRIGHT_HEADER
 + * (c)LGPL2+
 + *
@@ -115,10 +115,14 @@ index 0000000..8e4b5a9
 +
 +constexpr int OuterMargin = 0;
 +constexpr int MeterGap = 0;
-+constexpr int MeterInnerMargin = 1;
 +constexpr int TextHorizontalPadding = 0;
 +constexpr int PreferredTextPixelSize = 10;
 +constexpr int MinimumTextPixelSize = 7;
++
++// The one-second sampler uses a five-second EMA time constant. Cache both
++// weights so no exponential calculation is needed in the sampling loop.
++constexpr double EmaInputWeight = 0.18126924692201818;
++constexpr double EmaRetainedWeight = 0.8187307530779818;
 +
 +} // namespace
 +
@@ -175,14 +179,18 @@ index 0000000..8e4b5a9
 +                update();
 +            });
 +
++    m_historyTimerId = startTimer(HistorySampleIntervalMs, Qt::PreciseTimer);
 +    settingsChanged();
 +    refreshStats();
++    update();
 +}
 +
 +LXQtResourceMonitor::~LXQtResourceMonitor()
 +{
 +    if (m_timerId != -1)
 +        killTimer(m_timerId);
++    if (m_historyTimerId != -1)
++        killTimer(m_historyTimerId);
 +
 +    if (m_netCaptureProcess.state() != QProcess::NotRunning)
 +    {
@@ -264,55 +272,6 @@ index 0000000..8e4b5a9
 +    return QRect(availableRectangle.left(), y, availableRectangle.width(), height);
 +}
 +
-+QRect LXQtResourceMonitor::fillRect(const QRect &meterRectangle, double percent) const
-+{
-+    if (meterRectangle.isEmpty())
-+        return {};
-+
-+    const QRect innerRectangle = meterRectangle.adjusted(MeterInnerMargin,
-+                                                          MeterInnerMargin,
-+                                                          -MeterInnerMargin,
-+                                                          -MeterInnerMargin);
-+    if (innerRectangle.isEmpty())
-+        return {};
-+
-+    const double boundedPercent = std::clamp(percent, 0.0, 100.0);
-+    const double fraction = boundedPercent / 100.0;
-+
-+    if (isVerticalBarOrientation())
-+    {
-+        const int filledHeight = std::clamp(static_cast<int>(std::lround(innerRectangle.height() * fraction)),
-+                                            0,
-+                                            innerRectangle.height());
-+        if (filledHeight == 0)
-+            return {};
-+
-+        if (m_barOrientation == TopDownBar)
-+            return QRect(innerRectangle.left(), innerRectangle.top(), innerRectangle.width(), filledHeight);
-+
-+        return QRect(innerRectangle.left(),
-+                     innerRectangle.bottom() - filledHeight + 1,
-+                     innerRectangle.width(),
-+                     filledHeight);
-+    }
-+
-+    const int filledWidth = std::clamp(static_cast<int>(std::lround(innerRectangle.width() * fraction)),
-+                                       0,
-+                                       innerRectangle.width());
-+    if (filledWidth == 0)
-+        return {};
-+
-+    if (m_barOrientation == RightToLeftBar)
-+    {
-+        return QRect(innerRectangle.right() - filledWidth + 1,
-+                     innerRectangle.top(),
-+                     filledWidth,
-+                     innerRectangle.height());
-+    }
-+
-+    return QRect(innerRectangle.left(), innerRectangle.top(), filledWidth, innerRectangle.height());
-+}
-+
 +QColor LXQtResourceMonitor::resourceLightColor(Resource resource) const
 +{
 +    switch (resource)
@@ -385,29 +344,47 @@ index 0000000..8e4b5a9
 +
 +    const QColor lightColor = resourceLightColor(resource);
 +    const QColor darkColor = resourceDarkColor(resource);
-+
-+    // A resource-colored outline remains visible even at 0%, so resources
-+    // are distinguishable without spending panel width on text labels.
-+    QColor outlineColor = darkColor;
-+    outlineColor.setAlpha(150);
-+    painter.setPen(QPen(outlineColor, 1));
-+    painter.drawRect(meterRectangle.adjusted(0, 0, -1, -1));
-+
 +    const ResourceSnapshot &snapshot = m_resources[resourceIndex(resource)];
-+    const QRect filledRectangle = fillRect(meterRectangle, snapshot.valid ? snapshot.percent : 0.0);
-+    if (!filledRectangle.isEmpty())
++    if (snapshot.valid)
 +    {
-+        QLinearGradient gradient;
-+        if (isVerticalBarOrientation())
-+            gradient = QLinearGradient(filledRectangle.left(), 0, filledRectangle.right(), 0);
-+        else
-+            gradient = QLinearGradient(0, filledRectangle.top(), 0, filledRectangle.bottom());
-+
++        // Each horizontal pixel column represents a load threshold. Its EMA
++        // stays bright while the live value reaches that threshold, then fades
++        // after load drops. The default 19 px meter maps one state to each pixel.
++        QLinearGradient gradient(meterRectangle.left(), 0, meterRectangle.right(), 0);
 +        gradient.setSpread(QLinearGradient::ReflectSpread);
 +        gradient.setColorAt(0.0, lightColor);
 +        gradient.setColorAt(0.5, darkColor);
 +        gradient.setColorAt(1.0, lightColor);
-+        painter.fillRect(filledRectangle, gradient);
++        const int pixelColumnCount = meterRectangle.width();
++        const double thresholdStep = 100.0 / static_cast<double>(HistoryColumnCount);
++        const bool reverseProgress = m_barOrientation == TopDownBar
++            || m_barOrientation == RightToLeftBar;
++
++        for (int pixelColumn = 0; pixelColumn < pixelColumnCount; ++pixelColumn)
++        {
++            const int progressColumn = reverseProgress
++                ? pixelColumnCount - 1 - pixelColumn
++                : pixelColumn;
++            const std::size_t historyColumn = std::min(
++                static_cast<std::size_t>(progressColumn) * HistoryColumnCount
++                    / static_cast<std::size_t>(pixelColumnCount),
++                HistoryColumnCount - 1);
++            const double threshold = (static_cast<double>(historyColumn) + 0.5) * thresholdStep;
++            const double columnOpacity = snapshot.percent >= threshold
++                ? 100.0
++                : snapshot.history[historyColumn];
++            if (columnOpacity <= 0.5)
++                continue;
++
++            painter.save();
++            painter.setOpacity(std::clamp(columnOpacity / 100.0, 0.0, 1.0));
++            painter.fillRect(QRect(meterRectangle.left() + pixelColumn,
++                                   meterRectangle.top(),
++                                   1,
++                                   meterRectangle.height()),
++                             gradient);
++            painter.restore();
++        }
 +    }
 +
 +    if (!m_showText)
@@ -550,8 +527,43 @@ index 0000000..8e4b5a9
 +    }
 +    m_pendingNetworkBytes = {};
 +
++    updateHistory();
 +    updateToolTip();
-+    update();
++}
++
++void LXQtResourceMonitor::updateHistory()
++{
++    for (ResourceSnapshot &snapshot : m_resources)
++    {
++        if (!snapshot.valid)
++        {
++            snapshot.history.fill(0.0);
++            snapshot.historyInitialized = false;
++            continue;
++        }
++
++        const double currentPercent = std::clamp(snapshot.percent, 0.0, 100.0);
++        const double thresholdStep = 100.0 / static_cast<double>(HistoryColumnCount);
++        if (!snapshot.historyInitialized)
++        {
++            for (std::size_t column = 0; column < HistoryColumnCount; ++column)
++            {
++                const double threshold = (static_cast<double>(column) + 0.5) * thresholdStep;
++                snapshot.history[column] = currentPercent >= threshold ? 100.0 : 0.0;
++            }
++            snapshot.historyInitialized = true;
++        }
++        else
++        {
++            for (std::size_t column = 0; column < HistoryColumnCount; ++column)
++            {
++                const double threshold = (static_cast<double>(column) + 0.5) * thresholdStep;
++                const double inputValue = currentPercent >= threshold ? 100.0 : 0.0;
++                snapshot.history[column] = snapshot.history[column] * EmaRetainedWeight
++                    + inputValue * EmaInputWeight;
++            }
++        }
++    }
 +}
 +
 +void LXQtResourceMonitor::configureNetworkCapture()
@@ -754,13 +766,20 @@ index 0000000..8e4b5a9
 +
 +void LXQtResourceMonitor::timerEvent(QTimerEvent *event)
 +{
-+    if (event->timerId() != m_timerId)
++    if (event->timerId() == m_historyTimerId)
 +    {
-+        QFrame::timerEvent(event);
++        refreshStats();
++        update();
 +        return;
 +    }
 +
-+    refreshStats();
++    if (event->timerId() == m_timerId)
++    {
++        update();
++        return;
++    }
++
++    QFrame::timerEvent(event);
 +}
 +
 +void LXQtResourceMonitor::settingsChanged()
@@ -811,10 +830,10 @@ index 0000000..8e4b5a9
 +}
 diff --git a/plugin-resourcemonitor/lxqtresourcemonitor.h b/plugin-resourcemonitor/lxqtresourcemonitor.h
 new file mode 100644
-index 0000000..d49ab60
+index 0000000..6b64500
 --- /dev/null
 +++ b/plugin-resourcemonitor/lxqtresourcemonitor.h
-@@ -0,0 +1,141 @@
+@@ -0,0 +1,147 @@
 +/* BEGIN_COMMON_COPYRIGHT_HEADER
 + * (c)LGPL2+
 + *
@@ -890,6 +909,8 @@ index 0000000..d49ab60
 +        Count
 +    };
 +
++    static constexpr std::size_t HistoryColumnCount = 19;
++
 +    struct ResourceSnapshot
 +    {
 +        double percent{0.0};
@@ -898,6 +919,8 @@ index 0000000..d49ab60
 +        quint64 readBytesPerSecond{0};
 +        quint64 writeBytesPerSecond{0};
 +        bool valid{false};
++        bool historyInitialized{false};
++        std::array<double, HistoryColumnCount> history{};
 +    };
 +
 +    static constexpr std::size_t ResourceCount = static_cast<std::size_t>(Resource::Count);
@@ -905,6 +928,7 @@ index 0000000..d49ab60
 +    static constexpr int MinimumWidgetWidth = 48;
 +    static constexpr int MaximumWidgetWidth = 300;
 +    static constexpr int DefaultUpdateIntervalMs = 1000;
++    static constexpr int HistorySampleIntervalMs = 1000;
 +    static constexpr int MinimumUpdateIntervalMs = 500;
 +    static constexpr int MaximumUpdateIntervalMs = 10000000;
 +
@@ -917,7 +941,6 @@ index 0000000..d49ab60
 +    [[nodiscard]] int enabledResourceCount() const;
 +    [[nodiscard]] bool isVerticalBarOrientation() const;
 +    [[nodiscard]] QRect meterRect(int meterIndex, int meterCount) const;
-+    [[nodiscard]] QRect fillRect(const QRect &meterRectangle, double percent) const;
 +    [[nodiscard]] QColor resourceLightColor(Resource resource) const;
 +    [[nodiscard]] QColor resourceDarkColor(Resource resource) const;
 +    [[nodiscard]] QFont fittedTextFont(const QRect &meterRectangle) const;
@@ -926,6 +949,7 @@ index 0000000..d49ab60
 +    void configureNetworkCapture();
 +    void readNetworkCaptureOutput();
 +    void refreshStats();
++    void updateHistory();
 +    void updateIoSnapshot(Resource resource,
 +                          quint64 readBytes,
 +                          quint64 writeBytes,
@@ -942,6 +966,7 @@ index 0000000..d49ab60
 +    BarOrientation m_barOrientation{BottomUpBar};
 +    int m_updateIntervalMs{DefaultUpdateIntervalMs};
 +    int m_timerId{-1};
++    int m_historyTimerId{-1};
 +    bool m_statgrabInitialized{false};
 +    std::array<bool, ResourceCount> m_enabledResources{true, true, true, false, false, false};
 +    std::array<double, 3> m_ioPeakBytesPerSecond{};

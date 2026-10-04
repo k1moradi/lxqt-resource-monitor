@@ -58,19 +58,33 @@ RESOURCEMONITOR_NATIVE_OPTIMIZATIONS=ON ./packaging/build.sh
 
 You can compile on one computer and install binary `.deb` files on another. The target computer does not need `deb-src`, a compiler, or the LXQt Panel source tree. The `lxqt-resource-monitor` package contains the panel plugin. The separate `lxqt-resource-monitor-netcap` package is optional and is needed only for Local net and Internet traffic meters.
 
-Install the base plugin package:
+After building the packages, deploy the plugin on this computer with:
 
 ```bash
-sudo apt install ./build/packages/lxqt-resource-monitor_1.0.8-1_$(dpkg --print-architecture).deb
+./packaging/deploy.sh
 ```
 
-For IP-based Local net and Internet meters, also install the optional helper package:
+The script selects the newest package matching this computer's architecture, checks that it was built against the installed `lxqt-panel` version, installs or repairs it through APT, verifies the plugin library and LXQt registration file, checks shared-library dependencies, and offers to restart the current LXQt Panel process so its widget list is refreshed. Run it as your logged-in desktop user without `sudo`; it requests `sudo` only for APT. Restarting briefly hides the panel and taskbar.
+
+To validate the package without installing it, run:
 
 ```bash
-sudo apt install ./build/packages/lxqt-resource-monitor-netcap_1.0.8-1_$(dpkg --print-architecture).deb
+./packaging/deploy.sh --dry-run
 ```
 
-The build script records the build computer's exact `lxqt-panel` package version and detects shared-library dependencies. APT fetches missing runtime packages during installation. The packages are architecture and Ubuntu-release specific, and require the same `lxqt-panel` package version as the build computer. After installation, restart LXQt Panel and add **Resource Monitor** in **Panel Settings → Widgets**. To remove both packages, run `sudo apt remove lxqt-resource-monitor lxqt-resource-monitor-netcap`.
+For the optional Local net and Internet traffic meters, deploy the matching capture helper too:
+
+```bash
+./packaging/deploy.sh --with-netcap
+```
+
+You can pass package paths explicitly if the `.deb` files were copied elsewhere:
+
+```bash
+./packaging/deploy.sh /path/to/lxqt-resource-monitor.deb /path/to/lxqt-resource-monitor-netcap.deb
+```
+
+APT installs any missing runtime packages. These `.deb` files are architecture and Ubuntu-release specific, and require the exact same `lxqt-panel` package version used to build them. If the deployment script reports a panel-version mismatch, rebuild the packages on the target computer or on a machine with the same LXQt Panel package version; do not force-install the plugin. Once the panel restarts, add **Resource Monitor** in **Panel Settings → Widgets → Add**. To remove both packages, run `sudo apt remove lxqt-resource-monitor lxqt-resource-monitor-netcap`.
 
 ## Install for all users
 

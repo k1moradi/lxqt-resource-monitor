@@ -25,6 +25,7 @@
 #include <QDebug>
 #include <QFontMetrics>
 #include <QGuiApplication>
+#include <QGridLayout>
 #include <QHBoxLayout>
 #include <QLabel>
 #include <QMouseEvent>
@@ -60,6 +61,20 @@ constexpr int PreferredTextPixelSize = 10;
 constexpr int MinimumTextPixelSize = 7;
 constexpr int DetailsPopupWidth = 320;
 
+QString formatByteRate(quint64 bytesPerSecond)
+{
+    return ResourceMonitorMath::formatBytes(bytesPerSecond) + QStringLiteral("/s");
+}
+
+QString formatByteRate(double bytesPerSecond)
+{
+    const double maximumRate = static_cast<double>(std::numeric_limits<quint64>::max());
+    const quint64 roundedRate = bytesPerSecond >= maximumRate
+        ? std::numeric_limits<quint64>::max()
+        : static_cast<quint64>(std::max(0.0, std::round(bytesPerSecond)));
+    return formatByteRate(roundedRate);
+}
+
 } // namespace
 
 LXQtResourceMonitor::LXQtResourceMonitor(ILXQtPanelPlugin *plugin, QWidget *parent)
@@ -81,20 +96,86 @@ LXQtResourceMonitor::LXQtResourceMonitor(ILXQtPanelPlugin *plugin, QWidget *pare
     m_detailsPopup->setAutoFillBackground(true);
     m_detailsPopup->setFixedWidth(DetailsPopupWidth);
 
-    auto *detailsLayout = new QVBoxLayout(m_detailsPopup);
-    detailsLayout->setContentsMargins(10, 8, 10, 8);
-    detailsLayout->setSpacing(4);
+    auto *popupLayout = new QVBoxLayout(m_detailsPopup);
+    popupLayout->setContentsMargins(10, 8, 10, 8);
+    popupLayout->setSpacing(5);
 
     auto *detailsHeading = new QLabel(tr("Resource Monitor"), m_detailsPopup);
     QFont headingFont = detailsHeading->font();
     headingFont.setBold(true);
     detailsHeading->setFont(headingFont);
-    detailsLayout->addWidget(detailsHeading);
+    popupLayout->addWidget(detailsHeading);
 
-    m_detailsText = new QLabel(m_detailsPopup);
-    m_detailsText->setTextFormat(Qt::PlainText);
-    m_detailsText->setWordWrap(true);
-    detailsLayout->addWidget(m_detailsText);
+    m_noResourcesLabel = new QLabel(tr("No resources selected"), m_detailsPopup);
+    popupLayout->addWidget(m_noResourcesLabel);
+
+    const std::array<QString, ResourceCount> resourceNames{
+        tr("CPU"),
+        tr("RAM"),
+        tr("SWAP"),
+        tr("Local disk I/O"),
+        tr("Local network"),
+        tr("Internet")
+    };
+    for (std::size_t index = 0; index < ResourceCount; ++index)
+    {
+        PopupResourceDetails &details = m_popupResources[index];
+        auto *groupLayout = new QGridLayout;
+        groupLayout->setContentsMargins(0, 0, 0, 0);
+        groupLayout->setHorizontalSpacing(12);
+        groupLayout->setVerticalSpacing(2);
+
+        details.group = new QWidget(m_detailsPopup);
+        details.group->setLayout(groupLayout);
+        details.group->hide();
+
+        auto *name = new QLabel(resourceNames[index], details.group);
+        QFont nameFont = name->font();
+        nameFont.setBold(true);
+        name->setFont(nameFont);
+        groupLayout->addWidget(name, 0, 0);
+
+        details.primaryValue = new QLabel(details.group);
+        details.primaryValue->setAlignment(Qt::AlignRight | Qt::AlignVCenter);
+        groupLayout->addWidget(details.primaryValue, 0, 1);
+        groupLayout->setColumnStretch(1, 1);
+
+        int row = 1;
+        const auto addDetailRow = [&](std::size_t detailIndex, const QString &label) {
+            details.detailLabels[detailIndex] = new QLabel(label, details.group);
+            details.detailValues[detailIndex] = new QLabel(details.group);
+            details.detailValues[detailIndex]->setAlignment(Qt::AlignRight | Qt::AlignVCenter);
+            groupLayout->addWidget(details.detailLabels[detailIndex], row, 0);
+            groupLayout->addWidget(details.detailValues[detailIndex], row, 1);
+            details.detailLabels[detailIndex]->hide();
+            details.detailValues[detailIndex]->hide();
+            ++row;
+        };
+
+        switch (static_cast<Resource>(index))
+        {
+        case Resource::Cpu:
+            break;
+        case Resource::Memory:
+        case Resource::Swap:
+            addDetailRow(0, tr("Used / total"));
+            break;
+        case Resource::Disk:
+            addDetailRow(0, tr("Read"));
+            addDetailRow(1, tr("Write"));
+            break;
+        case Resource::LocalNet:
+        case Resource::Internet:
+            addDetailRow(0, tr("Receive"));
+            addDetailRow(1, tr("Transmit"));
+            addDetailRow(2, tr("Session peak"));
+            break;
+        case Resource::Count:
+            break;
+        }
+
+        popupLayout->addWidget(details.group);
+    }
 
 #ifdef STATGRAB_NEWER_THAN_0_90
     const sg_error initResult = sg_init(0);
@@ -455,6 +536,8 @@ void LXQtResourceMonitor::refreshStats()
 
     updateHistory();
     updateToolTip();
+    if (m_detailsPopup->isVisible())
+        updateDetailsPopup();
 }
 
 void LXQtResourceMonitor::updateHistory()
@@ -560,21 +643,9 @@ void LXQtResourceMonitor::updateIoSnapshot(Resource resource,
                                            quint64 writeBytes,
                                            qint64 elapsedMilliseconds)
 {
-    std::size_t peakIndex = 0;
-    switch (resource)
-    {
-    case Resource::Disk:
-        peakIndex = 0;
-        break;
-    case Resource::LocalNet:
-        peakIndex = 1;
-        break;
-    case Resource::Internet:
-        peakIndex = 2;
-        break;
-    default:
+    const std::size_t peakIndex = ioPeakIndex(resource);
+    if (peakIndex >= m_ioPeakBytesPerSecond.size())
         return;
-    }
 
     ResourceSnapshot &snapshot = m_resources[resourceIndex(resource)];
     const double intervalSeconds = static_cast<double>(std::max<qint64>(1, elapsedMilliseconds)) / 1000.0;
@@ -647,50 +718,166 @@ void LXQtResourceMonitor::updateToolTip()
                                   .arg(ResourceMonitorMath::formatBytes(swapSnapshot.totalBytes)));
     }
 
-    const auto formatIoRate = [](quint64 bytesPerSecond) {
-        return ResourceMonitorMath::formatBytes(bytesPerSecond) + QStringLiteral("/s");
-    };
     if (isResourceEnabled(Resource::Disk))
     {
         lines.emplaceBack(diskSnapshot.valid
             ? tr("Local disk I/O: read %1, write %2")
-                  .arg(formatIoRate(diskSnapshot.readBytesPerSecond))
-                  .arg(formatIoRate(diskSnapshot.writeBytesPerSecond))
+                  .arg(formatByteRate(diskSnapshot.readBytesPerSecond))
+                  .arg(formatByteRate(diskSnapshot.writeBytesPerSecond))
             : tr("Local disk I/O: unavailable"));
     }
     if (isResourceEnabled(Resource::LocalNet))
     {
         lines.emplaceBack(localNetSnapshot.valid
             ? tr("Local network I/O: receive %1, transmit %2")
-                  .arg(formatIoRate(localNetSnapshot.readBytesPerSecond))
-                  .arg(formatIoRate(localNetSnapshot.writeBytesPerSecond))
+                  .arg(formatByteRate(localNetSnapshot.readBytesPerSecond))
+                  .arg(formatByteRate(localNetSnapshot.writeBytesPerSecond))
             : tr("Local network I/O: unavailable (capture helper with CAP_NET_RAW required)"));
     }
     if (isResourceEnabled(Resource::Internet))
     {
         lines.emplaceBack(internetSnapshot.valid
             ? tr("Internet I/O: receive %1, transmit %2")
-                  .arg(formatIoRate(internetSnapshot.readBytesPerSecond))
-                  .arg(formatIoRate(internetSnapshot.writeBytesPerSecond))
+                  .arg(formatByteRate(internetSnapshot.readBytesPerSecond))
+                  .arg(formatByteRate(internetSnapshot.writeBytesPerSecond))
             : tr("Internet I/O: unavailable (capture helper with CAP_NET_RAW required)"));
     }
 
     if (lines.isEmpty())
         lines.emplaceBack(tr("No resources selected"));
 
-    const QString details = lines.join(QLatin1Char('\n'));
-    setToolTip(details);
-    m_detailsText->setText(details);
+    setToolTip(lines.join(QLatin1Char('\n')));
+}
 
-    // refreshStats() runs on the independent one-second history timer, so an
-    // open popup follows the same fresh samples as the rolling graph.
-    if (m_detailsPopup->isVisible())
+void LXQtResourceMonitor::updateDetailsPopup()
+{
+    bool geometryChanged = false;
+    bool hasEnabledResources = false;
+    const auto setVisibility = [&geometryChanged](QWidget *widget, bool visible) {
+        if (widget->isHidden() == visible)
+            geometryChanged = true;
+        widget->setVisible(visible);
+    };
+    const auto formatPercent = [this](double percent) {
+        return tr("%L1%").arg(percent, 0, 'f', 1);
+    };
+    const QString unavailable = tr("Unavailable");
+
+    for (std::size_t index = 0; index < ResourceCount; ++index)
+    {
+        const Resource resource = static_cast<Resource>(index);
+        PopupResourceDetails &details = m_popupResources[index];
+        const bool enabled = isResourceEnabled(resource);
+        setVisibility(details.group, enabled);
+        if (!enabled)
+            continue;
+
+        hasEnabledResources = true;
+        const ResourceSnapshot &snapshot = m_resources[index];
+        const auto setDetail = [&details, &setVisibility](std::size_t row,
+                                                          bool visible,
+                                                          const QString &value) {
+            QLabel *label = details.detailLabels[row];
+            QLabel *detailValue = details.detailValues[row];
+            if (label == nullptr || detailValue == nullptr)
+                return;
+
+            detailValue->setText(value);
+            setVisibility(label, visible);
+            setVisibility(detailValue, visible);
+        };
+        const auto hideDetails = [&setDetail]() {
+            for (std::size_t row = 0; row < 3; ++row)
+                setDetail(row, false, QString{});
+        };
+
+        switch (resource)
+        {
+        case Resource::Cpu:
+            details.primaryValue->setText(snapshot.valid
+                                              ? formatPercent(snapshot.percent)
+                                              : unavailable);
+            break;
+        case Resource::Memory:
+            if (snapshot.valid && snapshot.totalBytes > 0)
+            {
+                details.primaryValue->setText(formatPercent(snapshot.percent));
+                setDetail(0,
+                          true,
+                          tr("%1 / %2")
+                              .arg(ResourceMonitorMath::formatBytes(snapshot.usedBytes))
+                              .arg(ResourceMonitorMath::formatBytes(snapshot.totalBytes)));
+            }
+            else
+            {
+                details.primaryValue->setText(unavailable);
+                hideDetails();
+            }
+            break;
+        case Resource::Swap:
+            if (!snapshot.valid)
+            {
+                details.primaryValue->setText(unavailable);
+                hideDetails();
+            }
+            else if (snapshot.totalBytes == 0)
+            {
+                details.primaryValue->setText(tr("Not configured"));
+                hideDetails();
+            }
+            else
+            {
+                details.primaryValue->setText(formatPercent(snapshot.percent));
+                setDetail(0,
+                          true,
+                          tr("%1 / %2")
+                              .arg(ResourceMonitorMath::formatBytes(snapshot.usedBytes))
+                              .arg(ResourceMonitorMath::formatBytes(snapshot.totalBytes)));
+            }
+            break;
+        case Resource::Disk:
+            if (snapshot.valid)
+            {
+                details.primaryValue->clear();
+                setDetail(0, true, formatByteRate(snapshot.readBytesPerSecond));
+                setDetail(1, true, formatByteRate(snapshot.writeBytesPerSecond));
+            }
+            else
+            {
+                details.primaryValue->setText(unavailable);
+                hideDetails();
+            }
+            break;
+        case Resource::LocalNet:
+        case Resource::Internet:
+            if (snapshot.valid)
+            {
+                const std::size_t peakIndex = ioPeakIndex(resource);
+                details.primaryValue->clear();
+                setDetail(0, true, formatByteRate(snapshot.readBytesPerSecond));
+                setDetail(1, true, formatByteRate(snapshot.writeBytesPerSecond));
+                // This is the graph's session high-water mark for receive + transmit.
+                setDetail(2, true, formatByteRate(m_ioPeakBytesPerSecond[peakIndex]));
+            }
+            else
+            {
+                details.primaryValue->setText(unavailable);
+                hideDetails();
+            }
+            break;
+        case Resource::Count:
+            break;
+        }
+    }
+
+    setVisibility(m_noResourcesLabel, !hasEnabledResources);
+    if (m_detailsPopup->isVisible() && geometryChanged)
         positionDetailsPopup();
 }
 
 void LXQtResourceMonitor::showDetailsPopup()
 {
-    updateToolTip();
+    updateDetailsPopup();
     positionDetailsPopup();
     m_detailsPopup->show();
     m_detailsPopup->raise();
@@ -705,7 +892,9 @@ void LXQtResourceMonitor::positionDetailsPopup()
     if (screen == nullptr)
     {
         m_detailsPopup->adjustSize();
-        m_detailsPopup->move(mapToGlobal(QPoint(0, height() + 4)));
+        const QRect targetGeometry(mapToGlobal(QPoint(0, height() + 4)), m_detailsPopup->size());
+        if (m_detailsPopup->geometry() != targetGeometry)
+            m_detailsPopup->setGeometry(targetGeometry);
         return;
     }
 
@@ -724,7 +913,9 @@ void LXQtResourceMonitor::positionDetailsPopup()
                                   availableGeometry.bottom() - m_detailsPopup->height() + 1);
     position.setX(std::clamp(position.x(), availableGeometry.left(), maximumX));
     position.setY(std::clamp(position.y(), availableGeometry.top(), maximumY));
-    m_detailsPopup->move(position);
+    const QRect targetGeometry(position, m_detailsPopup->size());
+    if (m_detailsPopup->geometry() != targetGeometry)
+        m_detailsPopup->setGeometry(targetGeometry);
 }
 
 void LXQtResourceMonitor::mousePressEvent(QMouseEvent *event)
@@ -800,5 +991,8 @@ void LXQtResourceMonitor::settingsChanged()
     configureNetworkCapture();
     m_timerId = startTimer(m_updateIntervalMs);
     setSizes();
+    updateToolTip();
+    if (m_detailsPopup->isVisible())
+        updateDetailsPopup();
     update();
 }

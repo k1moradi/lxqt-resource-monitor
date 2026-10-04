@@ -86,6 +86,14 @@ private:
         ResourceMonitorHistory::RollingEma history;
     };
 
+    struct PopupResourceDetails
+    {
+        QWidget *group{nullptr};
+        QLabel *primaryValue{nullptr};
+        std::array<QLabel *, 3> detailLabels{};
+        std::array<QLabel *, 3> detailValues{};
+    };
+
     static constexpr std::size_t ResourceCount = static_cast<std::size_t>(Resource::Count);
     static constexpr int DefaultWidgetWidth = 57;
     static constexpr int MinimumWidgetWidth = 48;
@@ -98,6 +106,20 @@ private:
     [[nodiscard]] static constexpr std::size_t resourceIndex(Resource resource)
     {
         return static_cast<std::size_t>(resource);
+    }
+    [[nodiscard]] static constexpr std::size_t ioPeakIndex(Resource resource)
+    {
+        switch (resource)
+        {
+        case Resource::Disk:
+            return 0;
+        case Resource::LocalNet:
+            return 1;
+        case Resource::Internet:
+            return 2;
+        default:
+            return ResourceCount;
+        }
     }
 
     [[nodiscard]] bool isResourceEnabled(Resource resource) const;
@@ -117,6 +139,7 @@ private:
                           quint64 writeBytes,
                           qint64 elapsedMilliseconds);
     void updateToolTip();
+    void updateDetailsPopup();
     void showDetailsPopup();
     void positionDetailsPopup();
     void drawMeter(QPainter &painter, Resource resource, const QRect &meterRectangle);
@@ -124,7 +147,8 @@ private:
     ILXQtPanelPlugin *m_plugin;
     QWidget m_sizingWidget;
     QFrame *m_detailsPopup{nullptr};
-    QLabel *m_detailsText{nullptr};
+    QLabel *m_noResourcesLabel{nullptr};
+    std::array<PopupResourceDetails, ResourceCount> m_popupResources{};
     std::array<ResourceSnapshot, static_cast<std::size_t>(Resource::Count)> m_resources{};
 
     bool m_showText{true};

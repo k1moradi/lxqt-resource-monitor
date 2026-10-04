@@ -50,3 +50,9 @@ void LXQtResourceMonitorPlugin::settingsChanged()
     if (m_content != nullptr)
         m_content->settingsChanged();
 }
+
+void LXQtResourceMonitorPlugin::realign()
+{
+    if (m_content != nullptr)
+        m_content->panelGeometryChanged();
+}

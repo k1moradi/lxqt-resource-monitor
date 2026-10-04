@@ -30,6 +30,7 @@
 #include <cstddef>
 
 class ILXQtPanelPlugin;
+class QEvent;
 class QLabel;
 class QMouseEvent;
 class QPaintEvent;
@@ -53,6 +54,7 @@ public:
     ~LXQtResourceMonitor() override;
 
     void settingsChanged();
+    void panelGeometryChanged();
 
     void setFontColor(const QColor &value) { m_fontColor = value; }
     [[nodiscard]] QColor fontColor() const { return m_fontColor; }
@@ -62,6 +64,7 @@ protected:
     void paintEvent(QPaintEvent *event) override;
     void mousePressEvent(QMouseEvent *event) override;
     void resizeEvent(QResizeEvent *event) override;
+    void changeEvent(QEvent *event) override;
 
 private:
     enum class Resource : std::size_t
@@ -88,10 +91,15 @@ private:
 
     struct PopupResourceDetails
     {
-        QWidget *group{nullptr};
+        QWidget *section{nullptr};
+        QFrame *separator{nullptr};
         QLabel *primaryValue{nullptr};
-        std::array<QLabel *, 3> detailLabels{};
-        std::array<QLabel *, 3> detailValues{};
+        QLabel *secondaryValue{nullptr};
+        QWidget *metricsRow{nullptr};
+        std::array<QLabel *, 2> metricValues{};
+        QWidget *sessionPeakRow{nullptr};
+        QLabel *sessionPeakValue{nullptr};
+        QWidget *graph{nullptr};
     };
 
     static constexpr std::size_t ResourceCount = static_cast<std::size_t>(Resource::Count);

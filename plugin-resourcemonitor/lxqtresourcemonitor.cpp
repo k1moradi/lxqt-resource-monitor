@@ -23,9 +23,9 @@
 #include "../panel/pluginsettings.h"
 
 #include <QDebug>
+#include <QEvent>
 #include <QFontMetrics>
 #include <QGuiApplication>
-#include <QGridLayout>
 #include <QHBoxLayout>
 #include <QLabel>
 #include <QMouseEvent>
@@ -59,7 +59,10 @@ constexpr int MeterGap = 0;
 constexpr int TextHorizontalPadding = 0;
 constexpr int PreferredTextPixelSize = 10;
 constexpr int MinimumTextPixelSize = 7;
-constexpr int DetailsPopupWidth = 320;
+constexpr int MinimumPopupWidth = 180;
+constexpr int PreferredGraphWidth = 220;
+constexpr int PopupGraphHeight = 22;
+constexpr int PopupGap = 4;
 
 QString formatByteRate(quint64 bytesPerSecond)
 {
@@ -74,6 +77,98 @@ QString formatByteRate(double bytesPerSecond)
         : static_cast<quint64>(std::max(0.0, std::round(bytesPerSecond)));
     return formatByteRate(roundedRate);
 }
+
+QColor blendWithSurface(const QColor &accent, const QColor &surface, double accentWeight)
+{
+    const double surfaceWeight = 1.0 - accentWeight;
+    return QColor(qRound(accent.red() * accentWeight + surface.red() * surfaceWeight),
+                  qRound(accent.green() * accentWeight + surface.green() * surfaceWeight),
+                  qRound(accent.blue() * accentWeight + surface.blue() * surfaceWeight));
+}
+
+QColor contrastingResourceColor(QColor lightColor, QColor darkColor, const QColor &surface)
+{
+    lightColor.setAlpha(255);
+    darkColor.setAlpha(255);
+    const int lightDistance = std::abs(lightColor.lightness() - surface.lightness());
+    const int darkDistance = std::abs(darkColor.lightness() - surface.lightness());
+    return lightDistance >= darkDistance ? lightColor : darkColor;
+}
+
+class ResourceHistoryGraph final : public QWidget
+{
+public:
+    ResourceHistoryGraph(const ResourceMonitorHistory::RollingEma *history,
+                         const QColor &lightColor,
+                         const QColor &darkColor,
+                         QWidget *parent)
+        : QWidget(parent)
+        , m_history(history)
+        , m_lightColor(lightColor)
+        , m_darkColor(darkColor)
+    {
+        setAttribute(Qt::WA_OpaquePaintEvent);
+        setSizePolicy(QSizePolicy::Expanding, QSizePolicy::Fixed);
+        setMinimumHeight(PopupGraphHeight - 2);
+        setMaximumHeight(PopupGraphHeight);
+    }
+
+    [[nodiscard]] QSize sizeHint() const override
+    {
+        return {PreferredGraphWidth, PopupGraphHeight};
+    }
+
+    [[nodiscard]] QSize minimumSizeHint() const override
+    {
+        return {120, PopupGraphHeight - 2};
+    }
+
+protected:
+    void paintEvent(QPaintEvent *event) override
+    {
+        Q_UNUSED(event)
+
+        QPainter painter(this);
+        painter.setRenderHint(QPainter::Antialiasing, false);
+
+        const QColor surface = palette().color(QPalette::Base);
+        painter.fillRect(rect(), surface);
+        if (width() <= 0 || height() <= 0)
+            return;
+
+        const int baselineY = height() - 1;
+        painter.fillRect(QRect(0, baselineY, width(), 1), palette().color(QPalette::Mid));
+        if (m_history == nullptr || m_history->sampleCount() == 0 || height() <= 1)
+            return;
+
+        const ResourceMonitorHistory::VisibleWindow window = m_history->visibleWindow(width());
+        const int graphHeight = height() - 2;
+        const QColor accent = contrastingResourceColor(m_lightColor,
+                                                        m_darkColor,
+                                                        surface);
+        const QColor retainedColor = blendWithSurface(accent, surface, 0.58);
+        for (std::size_t column = 0; column < window.columnCount; ++column)
+        {
+            const int filledHeight = std::clamp(
+                static_cast<int>(std::lround(graphHeight
+                                             * m_history->sampleAt(window.sampleStart + column) / 100.0)),
+                0,
+                graphHeight);
+            if (filledHeight == 0)
+                continue;
+
+            const int x = window.firstColumn + static_cast<int>(column);
+            const int y = baselineY - filledHeight;
+            const QColor &color = column + 1 == window.columnCount ? accent : retainedColor;
+            painter.fillRect(QRect(x, y, 1, filledHeight), color);
+        }
+    }
+
+private:
+    const ResourceMonitorHistory::RollingEma *m_history;
+    QColor m_lightColor;
+    QColor m_darkColor;
+};
 
 } // namespace
 
@@ -92,89 +187,151 @@ LXQtResourceMonitor::LXQtResourceMonitor(ILXQtPanelPlugin *plugin, QWidget *pare
     m_detailsPopup = new QFrame(this, Qt::Popup | Qt::FramelessWindowHint);
     m_detailsPopup->setObjectName(QStringLiteral("LXQtResourceMonitorDetailsPopup"));
     m_detailsPopup->setFrameShape(QFrame::StyledPanel);
-    m_detailsPopup->setFrameShadow(QFrame::Raised);
+    m_detailsPopup->setFrameShadow(QFrame::Plain);
+    m_detailsPopup->setLineWidth(1);
     m_detailsPopup->setAutoFillBackground(true);
-    m_detailsPopup->setFixedWidth(DetailsPopupWidth);
+    m_detailsPopup->setBackgroundRole(QPalette::Window);
+    m_detailsPopup->setForegroundRole(QPalette::WindowText);
+    m_detailsPopup->setMinimumWidth(MinimumPopupWidth);
+    m_detailsPopup->setMaximumWidth(360);
 
     auto *popupLayout = new QVBoxLayout(m_detailsPopup);
-    popupLayout->setContentsMargins(10, 8, 10, 8);
-    popupLayout->setSpacing(5);
+    popupLayout->setContentsMargins(12, 10, 12, 10);
+    popupLayout->setSpacing(0);
 
     auto *detailsHeading = new QLabel(tr("Resource Monitor"), m_detailsPopup);
     QFont headingFont = detailsHeading->font();
-    headingFont.setBold(true);
+    headingFont.setWeight(QFont::DemiBold);
     detailsHeading->setFont(headingFont);
     popupLayout->addWidget(detailsHeading);
 
+    auto *headingSeparator = new QFrame(m_detailsPopup);
+    headingSeparator->setFrameShape(QFrame::HLine);
+    headingSeparator->setFrameShadow(QFrame::Plain);
+    popupLayout->addWidget(headingSeparator);
+
     m_noResourcesLabel = new QLabel(tr("No resources selected"), m_detailsPopup);
+    m_noResourcesLabel->hide();
     popupLayout->addWidget(m_noResourcesLabel);
+
+    const QFont secondaryFont = [this]() {
+        QFont font = m_detailsPopup->font();
+        if (font.pointSizeF() > 0.0)
+            font.setPointSizeF(std::max(1.0, font.pointSizeF() - 1.0));
+        else if (font.pixelSize() > 0)
+            font.setPixelSize(std::max(8, font.pixelSize() - 1));
+        return font;
+    }();
 
     const std::array<QString, ResourceCount> resourceNames{
         tr("CPU"),
         tr("RAM"),
         tr("SWAP"),
-        tr("Local disk I/O"),
+        tr("Local disk"),
         tr("Local network"),
         tr("Internet")
     };
     for (std::size_t index = 0; index < ResourceCount; ++index)
     {
         PopupResourceDetails &details = m_popupResources[index];
-        auto *groupLayout = new QGridLayout;
-        groupLayout->setContentsMargins(0, 0, 0, 0);
-        groupLayout->setHorizontalSpacing(12);
-        groupLayout->setVerticalSpacing(2);
+        details.separator = new QFrame(m_detailsPopup);
+        details.separator->setFrameShape(QFrame::HLine);
+        details.separator->setFrameShadow(QFrame::Plain);
+        details.separator->hide();
+        popupLayout->addWidget(details.separator);
 
-        details.group = new QWidget(m_detailsPopup);
-        details.group->setLayout(groupLayout);
-        details.group->hide();
+        details.section = new QWidget(m_detailsPopup);
+        details.section->hide();
+        auto *sectionLayout = new QVBoxLayout(details.section);
+        sectionLayout->setContentsMargins(0, 5, 0, 5);
+        sectionLayout->setSpacing(3);
 
-        auto *name = new QLabel(resourceNames[index], details.group);
-        QFont nameFont = name->font();
-        nameFont.setBold(true);
+        auto *headingLayout = new QHBoxLayout;
+        headingLayout->setContentsMargins(0, 0, 0, 0);
+        headingLayout->setSpacing(8);
+        auto *name = new QLabel(resourceNames[index], details.section);
+        QFont nameFont = details.section->font();
+        nameFont.setWeight(QFont::DemiBold);
         name->setFont(nameFont);
-        groupLayout->addWidget(name, 0, 0);
+        headingLayout->addWidget(name);
+        headingLayout->addStretch(1);
 
-        details.primaryValue = new QLabel(details.group);
+        details.primaryValue = new QLabel(details.section);
+        QFont primaryFont = details.primaryValue->font();
+        primaryFont.setWeight(QFont::DemiBold);
+        details.primaryValue->setFont(primaryFont);
         details.primaryValue->setAlignment(Qt::AlignRight | Qt::AlignVCenter);
-        groupLayout->addWidget(details.primaryValue, 0, 1);
-        groupLayout->setColumnStretch(1, 1);
+        details.primaryValue->hide();
+        headingLayout->addWidget(details.primaryValue);
+        sectionLayout->addLayout(headingLayout);
 
-        int row = 1;
-        const auto addDetailRow = [&](std::size_t detailIndex, const QString &label) {
-            details.detailLabels[detailIndex] = new QLabel(label, details.group);
-            details.detailValues[detailIndex] = new QLabel(details.group);
-            details.detailValues[detailIndex]->setAlignment(Qt::AlignRight | Qt::AlignVCenter);
-            groupLayout->addWidget(details.detailLabels[detailIndex], row, 0);
-            groupLayout->addWidget(details.detailValues[detailIndex], row, 1);
-            details.detailLabels[detailIndex]->hide();
-            details.detailValues[detailIndex]->hide();
-            ++row;
-        };
+        details.secondaryValue = new QLabel(details.section);
+        details.secondaryValue->setFont(secondaryFont);
+        details.secondaryValue->hide();
+        sectionLayout->addWidget(details.secondaryValue);
 
+        details.metricsRow = new QWidget(details.section);
+        auto *metricsLayout = new QHBoxLayout(details.metricsRow);
+        metricsLayout->setContentsMargins(0, 0, 0, 0);
+        metricsLayout->setSpacing(12);
+
+        std::array<QString, 2> metricCaptions{};
         switch (static_cast<Resource>(index))
         {
-        case Resource::Cpu:
-            break;
-        case Resource::Memory:
-        case Resource::Swap:
-            addDetailRow(0, tr("Used / total"));
-            break;
         case Resource::Disk:
-            addDetailRow(0, tr("Read"));
-            addDetailRow(1, tr("Write"));
+            metricCaptions = {tr("↓ Read"), tr("↑ Write")};
             break;
         case Resource::LocalNet:
         case Resource::Internet:
-            addDetailRow(0, tr("Receive"));
-            addDetailRow(1, tr("Transmit"));
-            addDetailRow(2, tr("Session peak"));
+            metricCaptions = {tr("↓ Receive"), tr("↑ Transmit")};
             break;
-        case Resource::Count:
+        default:
             break;
         }
 
-        popupLayout->addWidget(details.group);
+        for (std::size_t metric = 0; metric < details.metricValues.size(); ++metric)
+        {
+            auto *metricCell = new QWidget(details.metricsRow);
+            auto *metricLayout = new QVBoxLayout(metricCell);
+            metricLayout->setContentsMargins(0, 0, 0, 0);
+            metricLayout->setSpacing(0);
+
+            auto *caption = new QLabel(metricCaptions[metric], metricCell);
+            caption->setFont(secondaryFont);
+            caption->setAlignment(metric == 0 ? Qt::AlignLeft : Qt::AlignRight);
+            metricLayout->addWidget(caption);
+
+            details.metricValues[metric] = new QLabel(metricCell);
+            details.metricValues[metric]->setAlignment(metric == 0 ? Qt::AlignLeft : Qt::AlignRight);
+            metricLayout->addWidget(details.metricValues[metric]);
+            metricsLayout->addWidget(metricCell, 1);
+        }
+        details.metricsRow->hide();
+        sectionLayout->addWidget(details.metricsRow);
+
+        const Resource resource = static_cast<Resource>(index);
+        details.graph = new ResourceHistoryGraph(&m_resources[index].history,
+                                                  resourceLightColor(resource),
+                                                  resourceDarkColor(resource),
+                                                  details.section);
+        details.graph->hide();
+        sectionLayout->addWidget(details.graph);
+
+        details.sessionPeakRow = new QWidget(details.section);
+        auto *sessionPeakLayout = new QHBoxLayout(details.sessionPeakRow);
+        sessionPeakLayout->setContentsMargins(0, 0, 0, 0);
+        sessionPeakLayout->setSpacing(8);
+        auto *sessionPeakLabel = new QLabel(tr("Combined session peak"), details.sessionPeakRow);
+        sessionPeakLabel->setFont(secondaryFont);
+        sessionPeakLayout->addWidget(sessionPeakLabel);
+        sessionPeakLayout->addStretch(1);
+        details.sessionPeakValue = new QLabel(details.sessionPeakRow);
+        details.sessionPeakValue->setFont(secondaryFont);
+        sessionPeakLayout->addWidget(details.sessionPeakValue);
+        details.sessionPeakRow->hide();
+        sectionLayout->addWidget(details.sessionPeakRow);
+
+        popupLayout->addWidget(details.section);
     }
 
 #ifdef STATGRAB_NEWER_THAN_0_90
@@ -270,6 +427,41 @@ void LXQtResourceMonitor::resizeEvent(QResizeEvent *event)
     QFrame::resizeEvent(event);
     setSizes();
     update();
+    if (m_detailsPopup != nullptr && m_detailsPopup->isVisible())
+        positionDetailsPopup();
+}
+
+void LXQtResourceMonitor::changeEvent(QEvent *event)
+{
+    QFrame::changeEvent(event);
+
+    if (m_detailsPopup == nullptr)
+        return;
+
+    switch (event->type())
+    {
+    case QEvent::PaletteChange:
+    case QEvent::ApplicationPaletteChange:
+    case QEvent::StyleChange:
+    case QEvent::FontChange:
+        m_detailsPopup->update();
+        for (const PopupResourceDetails &details : m_popupResources)
+        {
+            if (details.graph != nullptr)
+                details.graph->update();
+        }
+        if (m_detailsPopup->isVisible())
+            positionDetailsPopup();
+        break;
+    default:
+        break;
+    }
+}
+
+void LXQtResourceMonitor::panelGeometryChanged()
+{
+    if (m_detailsPopup != nullptr && m_detailsPopup->isVisible())
+        positionDetailsPopup();
 }
 
 QRect LXQtResourceMonitor::meterRect(int meterIndex, int meterCount) const
@@ -754,98 +946,126 @@ void LXQtResourceMonitor::updateDetailsPopup()
     bool geometryChanged = false;
     bool hasEnabledResources = false;
     const auto setVisibility = [&geometryChanged](QWidget *widget, bool visible) {
-        if (widget->isHidden() == visible)
+        const bool shouldBeHidden = !visible;
+        if (widget->isHidden() != shouldBeHidden)
             geometryChanged = true;
         widget->setVisible(visible);
+    };
+    const auto setTextIfChanged = [](QLabel *label, const QString &text) {
+        if (label->text() != text)
+            label->setText(text);
     };
     const auto formatPercent = [this](double percent) {
         return tr("%L1%").arg(percent, 0, 'f', 1);
     };
     const QString unavailable = tr("Unavailable");
+    const auto setTextAndVisibility = [&setVisibility, &setTextIfChanged](QLabel *label,
+                                                                          const QString &text,
+                                                                          bool visible) {
+        setTextIfChanged(label, text);
+        setVisibility(label, visible);
+    };
 
     for (std::size_t index = 0; index < ResourceCount; ++index)
     {
         const Resource resource = static_cast<Resource>(index);
         PopupResourceDetails &details = m_popupResources[index];
         const bool enabled = isResourceEnabled(resource);
-        setVisibility(details.group, enabled);
+        setVisibility(details.separator, enabled && hasEnabledResources);
+        setVisibility(details.section, enabled);
         if (!enabled)
             continue;
 
         hasEnabledResources = true;
         const ResourceSnapshot &snapshot = m_resources[index];
-        const auto setDetail = [&details, &setVisibility](std::size_t row,
-                                                          bool visible,
-                                                          const QString &value) {
-            QLabel *label = details.detailLabels[row];
-            QLabel *detailValue = details.detailValues[row];
-            if (label == nullptr || detailValue == nullptr)
-                return;
-
-            detailValue->setText(value);
-            setVisibility(label, visible);
-            setVisibility(detailValue, visible);
-        };
-        const auto hideDetails = [&setDetail]() {
-            for (std::size_t row = 0; row < 3; ++row)
-                setDetail(row, false, QString{});
+        const auto showHistory = [&details, &snapshot, &setVisibility]() {
+            const bool hasHistory = snapshot.valid && snapshot.history.sampleCount() > 0;
+            setVisibility(details.graph, hasHistory);
+            if (details.graph->isVisible())
+                details.graph->update();
         };
 
         switch (resource)
         {
         case Resource::Cpu:
-            details.primaryValue->setText(snapshot.valid
-                                              ? formatPercent(snapshot.percent)
-                                              : unavailable);
+            setTextAndVisibility(details.primaryValue,
+                                 snapshot.valid ? formatPercent(snapshot.percent) : unavailable,
+                                 true);
+            setVisibility(details.secondaryValue, false);
+            setVisibility(details.metricsRow, false);
+            setVisibility(details.sessionPeakRow, false);
+            showHistory();
             break;
         case Resource::Memory:
             if (snapshot.valid && snapshot.totalBytes > 0)
             {
-                details.primaryValue->setText(formatPercent(snapshot.percent));
-                setDetail(0,
-                          true,
-                          tr("%1 / %2")
-                              .arg(ResourceMonitorMath::formatBytes(snapshot.usedBytes))
-                              .arg(ResourceMonitorMath::formatBytes(snapshot.totalBytes)));
+                setTextAndVisibility(details.primaryValue, formatPercent(snapshot.percent), true);
+                setTextAndVisibility(details.secondaryValue,
+                                     tr("%1 / %2")
+                                         .arg(ResourceMonitorMath::formatBytes(snapshot.usedBytes))
+                                         .arg(ResourceMonitorMath::formatBytes(snapshot.totalBytes)),
+                                     true);
+                setVisibility(details.metricsRow, false);
+                setVisibility(details.sessionPeakRow, false);
+                showHistory();
             }
             else
             {
-                details.primaryValue->setText(unavailable);
-                hideDetails();
+                setTextAndVisibility(details.primaryValue, unavailable, true);
+                setVisibility(details.secondaryValue, false);
+                setVisibility(details.metricsRow, false);
+                setVisibility(details.sessionPeakRow, false);
+                setVisibility(details.graph, false);
             }
             break;
         case Resource::Swap:
             if (!snapshot.valid)
             {
-                details.primaryValue->setText(unavailable);
-                hideDetails();
+                setTextAndVisibility(details.primaryValue, unavailable, true);
+                setVisibility(details.secondaryValue, false);
+                setVisibility(details.metricsRow, false);
+                setVisibility(details.sessionPeakRow, false);
+                setVisibility(details.graph, false);
             }
             else if (snapshot.totalBytes == 0)
             {
-                details.primaryValue->setText(tr("Not configured"));
-                hideDetails();
+                setTextAndVisibility(details.primaryValue, tr("No swap configured"), true);
+                setVisibility(details.secondaryValue, false);
+                setVisibility(details.metricsRow, false);
+                setVisibility(details.sessionPeakRow, false);
+                setVisibility(details.graph, false);
             }
             else
             {
-                details.primaryValue->setText(formatPercent(snapshot.percent));
-                setDetail(0,
-                          true,
-                          tr("%1 / %2")
-                              .arg(ResourceMonitorMath::formatBytes(snapshot.usedBytes))
-                              .arg(ResourceMonitorMath::formatBytes(snapshot.totalBytes)));
+                setTextAndVisibility(details.primaryValue, formatPercent(snapshot.percent), true);
+                setTextAndVisibility(details.secondaryValue,
+                                     tr("%1 / %2")
+                                         .arg(ResourceMonitorMath::formatBytes(snapshot.usedBytes))
+                                         .arg(ResourceMonitorMath::formatBytes(snapshot.totalBytes)),
+                                     true);
+                setVisibility(details.metricsRow, false);
+                setVisibility(details.sessionPeakRow, false);
+                showHistory();
             }
             break;
         case Resource::Disk:
             if (snapshot.valid)
             {
-                details.primaryValue->clear();
-                setDetail(0, true, formatByteRate(snapshot.readBytesPerSecond));
-                setDetail(1, true, formatByteRate(snapshot.writeBytesPerSecond));
+                setTextAndVisibility(details.primaryValue, QString{}, false);
+                setVisibility(details.secondaryValue, false);
+                setTextIfChanged(details.metricValues[0], formatByteRate(snapshot.readBytesPerSecond));
+                setTextIfChanged(details.metricValues[1], formatByteRate(snapshot.writeBytesPerSecond));
+                setVisibility(details.metricsRow, true);
+                setVisibility(details.sessionPeakRow, false);
+                showHistory();
             }
             else
             {
-                details.primaryValue->setText(unavailable);
-                hideDetails();
+                setTextAndVisibility(details.primaryValue, unavailable, true);
+                setVisibility(details.secondaryValue, false);
+                setVisibility(details.metricsRow, false);
+                setVisibility(details.sessionPeakRow, false);
+                setVisibility(details.graph, false);
             }
             break;
         case Resource::LocalNet:
@@ -853,16 +1073,24 @@ void LXQtResourceMonitor::updateDetailsPopup()
             if (snapshot.valid)
             {
                 const std::size_t peakIndex = ioPeakIndex(resource);
-                details.primaryValue->clear();
-                setDetail(0, true, formatByteRate(snapshot.readBytesPerSecond));
-                setDetail(1, true, formatByteRate(snapshot.writeBytesPerSecond));
-                // This is the graph's session high-water mark for receive + transmit.
-                setDetail(2, true, formatByteRate(m_ioPeakBytesPerSecond[peakIndex]));
+                setTextAndVisibility(details.primaryValue, QString{}, false);
+                setVisibility(details.secondaryValue, false);
+                setTextIfChanged(details.metricValues[0], formatByteRate(snapshot.readBytesPerSecond));
+                setTextIfChanged(details.metricValues[1], formatByteRate(snapshot.writeBytesPerSecond));
+                setVisibility(details.metricsRow, true);
+                // The existing network high-water mark is max(receive + transmit).
+                setTextIfChanged(details.sessionPeakValue,
+                                 formatByteRate(m_ioPeakBytesPerSecond[peakIndex]));
+                setVisibility(details.sessionPeakRow, true);
+                showHistory();
             }
             else
             {
-                details.primaryValue->setText(unavailable);
-                hideDetails();
+                setTextAndVisibility(details.primaryValue, unavailable, true);
+                setVisibility(details.secondaryValue, false);
+                setVisibility(details.metricsRow, false);
+                setVisibility(details.sessionPeakRow, false);
+                setVisibility(details.graph, false);
             }
             break;
         case Resource::Count:
@@ -878,6 +1106,8 @@ void LXQtResourceMonitor::updateDetailsPopup()
 void LXQtResourceMonitor::showDetailsPopup()
 {
     updateDetailsPopup();
+    if (m_plugin != nullptr && m_plugin->panel() != nullptr)
+        m_plugin->panel()->willShowWindow(m_detailsPopup);
     positionDetailsPopup();
     m_detailsPopup->show();
     m_detailsPopup->raise();
@@ -885,6 +1115,66 @@ void LXQtResourceMonitor::showDetailsPopup()
 
 void LXQtResourceMonitor::positionDetailsPopup()
 {
+    enum class Side
+    {
+        Above,
+        Below,
+        Left,
+        Right
+    };
+
+    const ILXQtPanel *panel = m_plugin != nullptr ? m_plugin->panel() : nullptr;
+    const ILXQtPanel::Position panelPosition = panel != nullptr
+        ? panel->position()
+        : ILXQtPanel::PositionBottom;
+
+    Side preferredSide = Side::Above;
+    switch (panelPosition)
+    {
+    case ILXQtPanel::PositionBottom:
+        preferredSide = Side::Above;
+        break;
+    case ILXQtPanel::PositionTop:
+        preferredSide = Side::Below;
+        break;
+    case ILXQtPanel::PositionLeft:
+        preferredSide = Side::Right;
+        break;
+    case ILXQtPanel::PositionRight:
+        preferredSide = Side::Left;
+        break;
+    }
+
+    const auto oppositeSide = [](Side side) {
+        switch (side)
+        {
+        case Side::Above:
+            return Side::Below;
+        case Side::Below:
+            return Side::Above;
+        case Side::Left:
+            return Side::Right;
+        case Side::Right:
+            return Side::Left;
+        }
+        return Side::Above;
+    };
+    const QRect widgetGeometry(mapToGlobal(QPoint(0, 0)), size());
+    const auto positionForSide = [&widgetGeometry](Side side, const QSize &popupSize) {
+        switch (side)
+        {
+        case Side::Above:
+            return QPoint(widgetGeometry.left(), widgetGeometry.top() - popupSize.height() - PopupGap);
+        case Side::Below:
+            return QPoint(widgetGeometry.left(), widgetGeometry.bottom() + 1 + PopupGap);
+        case Side::Left:
+            return QPoint(widgetGeometry.left() - popupSize.width() - PopupGap, widgetGeometry.top());
+        case Side::Right:
+            return QPoint(widgetGeometry.right() + 1 + PopupGap, widgetGeometry.top());
+        }
+        return widgetGeometry.topLeft();
+    };
+
     QScreen *screen = QGuiApplication::screenAt(mapToGlobal(rect().center()));
     if (screen == nullptr)
         screen = QGuiApplication::primaryScreen();
@@ -892,28 +1182,68 @@ void LXQtResourceMonitor::positionDetailsPopup()
     if (screen == nullptr)
     {
         m_detailsPopup->adjustSize();
-        const QRect targetGeometry(mapToGlobal(QPoint(0, height() + 4)), m_detailsPopup->size());
+        const QRect targetGeometry(positionForSide(preferredSide, m_detailsPopup->size()),
+                                   m_detailsPopup->size());
         if (m_detailsPopup->geometry() != targetGeometry)
             m_detailsPopup->setGeometry(targetGeometry);
         return;
     }
 
     const QRect availableGeometry = screen->availableGeometry();
-    m_detailsPopup->setFixedWidth(std::min(DetailsPopupWidth, availableGeometry.width()));
+    const int maximumWidth = std::max(1, std::min(360, availableGeometry.width()));
+    const int maximumHeight = std::max(1, availableGeometry.height());
+    m_detailsPopup->setMinimumWidth(std::min(MinimumPopupWidth, maximumWidth));
+    m_detailsPopup->setMaximumSize(maximumWidth, maximumHeight);
     m_detailsPopup->adjustSize();
 
-    const QPoint widgetTopLeft = mapToGlobal(QPoint(0, 0));
-    QPoint position = mapToGlobal(QPoint(0, height() + 4));
-    if (position.y() + m_detailsPopup->height() > availableGeometry.bottom() + 1)
-        position.setY(widgetTopLeft.y() - m_detailsPopup->height() - 4);
+    const QSize popupSize = m_detailsPopup->size();
+    QPoint position = positionForSide(preferredSide, popupSize);
+    if (!availableGeometry.contains(QRect(position, popupSize)))
+    {
+        const Side alternateSide = oppositeSide(preferredSide);
+        const QPoint alternatePosition = positionForSide(alternateSide, popupSize);
+        if (availableGeometry.contains(QRect(alternatePosition, popupSize)))
+        {
+            position = alternatePosition;
+        }
+        else
+        {
+            const auto availableSpaceForSide = [&availableGeometry, &widgetGeometry](Side side) {
+                switch (side)
+                {
+                case Side::Above:
+                    return std::max(0, widgetGeometry.top() - PopupGap - availableGeometry.top());
+                case Side::Below:
+                    return std::max(0,
+                                    availableGeometry.bottom() + 1
+                                        - (widgetGeometry.bottom() + 1 + PopupGap));
+                case Side::Left:
+                    return std::max(0, widgetGeometry.left() - PopupGap - availableGeometry.left());
+                case Side::Right:
+                    return std::max(0,
+                                    availableGeometry.right() + 1
+                                        - (widgetGeometry.right() + 1 + PopupGap));
+                }
+                return 0;
+            };
+            const int popupExtentForSide = preferredSide == Side::Above || preferredSide == Side::Below
+                ? popupSize.height()
+                : popupSize.width();
+            if (availableSpaceForSide(preferredSide) < popupExtentForSide
+                && availableSpaceForSide(alternateSide) > availableSpaceForSide(preferredSide))
+            {
+                position = alternatePosition;
+            }
+        }
+    }
 
     const int maximumX = std::max(availableGeometry.left(),
-                                  availableGeometry.right() - m_detailsPopup->width() + 1);
+                                  availableGeometry.right() - popupSize.width() + 1);
     const int maximumY = std::max(availableGeometry.top(),
-                                  availableGeometry.bottom() - m_detailsPopup->height() + 1);
+                                  availableGeometry.bottom() - popupSize.height() + 1);
     position.setX(std::clamp(position.x(), availableGeometry.left(), maximumX));
     position.setY(std::clamp(position.y(), availableGeometry.top(), maximumY));
-    const QRect targetGeometry(position, m_detailsPopup->size());
+    const QRect targetGeometry(position, popupSize);
     if (m_detailsPopup->geometry() != targetGeometry)
         m_detailsPopup->setGeometry(targetGeometry);
 }

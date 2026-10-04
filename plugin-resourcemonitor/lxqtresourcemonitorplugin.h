@@ -42,6 +42,7 @@ public:
 
 protected:
     void settingsChanged() override;
+    void realign() override;
 
 private:
     std::unique_ptr<QWidget> m_widget;

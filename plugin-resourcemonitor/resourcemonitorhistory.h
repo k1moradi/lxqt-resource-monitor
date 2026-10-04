@@ -47,6 +47,16 @@ public:
         m_nextWriteIndex = 0;
     }
 
+    void scale(double factor) noexcept
+    {
+        if (!std::isfinite(factor) || factor < 0.0)
+            return;
+
+        for (double &sample : m_samples)
+            sample = std::clamp(sample * factor, 0.0, 100.0);
+        m_emaPercent = std::clamp(m_emaPercent * factor, 0.0, 100.0);
+    }
+
     void update(double percent, bool valid) noexcept
     {
         if (!valid)

@@ -558,7 +558,19 @@ void LXQtResourceMonitor::updateIoSnapshot(Resource resource,
     snapshot.valid = true;
 
     double &peakRate = m_ioPeakBytesPerSecond[peakIndex];
-    peakRate = std::max(totalRate, peakRate * 0.9);
+    const double previousPeakRate = peakRate;
+    const bool networkResource = resource == Resource::LocalNet
+        || resource == Resource::Internet;
+    peakRate = networkResource
+        ? std::max(totalRate, previousPeakRate)
+        : std::max(totalRate, previousPeakRate * 0.9);
+
+    if (networkResource && peakRate > previousPeakRate && previousPeakRate > 0.0)
+    {
+        // Keep retained EMA columns on the same scale as the new all-time peak.
+        snapshot.history.scale(previousPeakRate / peakRate);
+    }
+
     snapshot.percent = peakRate > 0.0
         ? std::clamp(totalRate * 100.0 / peakRate, 0.0, 100.0)
         : 0.0;

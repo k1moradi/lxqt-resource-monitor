@@ -701,7 +701,7 @@ index 0000000..4a09f00
 +        if (!swapSnapshot.valid)
 +            lines.emplaceBack(tr("SWAP: unavailable"));
 +        else if (swapSnapshot.totalBytes == 0)
-+            lines.emplaceBack(tr("SWAP: not configured"));
++            lines.emplaceBack(tr("SWAP: no active swap"));
 +        else
 +            lines.emplaceBack(tr("SWAP: %1% — %2 / %3")
 +                                  .arg(qRound(swapSnapshot.percent))

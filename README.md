@@ -16,7 +16,7 @@ The commands below assume you have already cloned this repository and are runnin
 - Left-click the widget to open a compact graphical details popup for enabled resources. It shows current utilization with rolling history, disk read/write rates, and network receive/transmit rates with each network meter's session peak. Values and graphs refresh with the normal one-second sample.
 - Network traffic is classified by its remote IP address: private/local IP traffic appears under Local net; public IP traffic appears under Internet. The optional `resourcemonitor-netcap` helper reads IP headers only and does not save addresses or packet contents. Network sampling requires this helper to be installed as a root-owned executable with `CAP_NET_RAW`; the helper drops that capability after opening its packet socket.
 - Local net and Internet percentages are each relative to the highest combined receive and transmit rate observed by that monitor session. These are activity levels, not percentages of physical link capacity.
-- If swap is not configured, its meter is empty and the tooltip says `SWAP: not configured`.
+- If the system reports no active swap capacity, the meter remains empty and the popup/tooltip indicate that there is no active swap.
 
 RAM usage uses libstatgrab's `used / total` values. On Linux, libstatgrab treats cached file memory as reclaimable rather than used memory.
 

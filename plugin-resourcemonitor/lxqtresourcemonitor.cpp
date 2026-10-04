@@ -902,7 +902,7 @@ void LXQtResourceMonitor::updateToolTip()
         if (!swapSnapshot.valid)
             lines.emplaceBack(tr("SWAP: unavailable"));
         else if (swapSnapshot.totalBytes == 0)
-            lines.emplaceBack(tr("SWAP: not configured"));
+            lines.emplaceBack(tr("SWAP: no active swap"));
         else
             lines.emplaceBack(tr("SWAP: %1% — %2 / %3")
                                   .arg(qRound(swapSnapshot.percent))
@@ -1029,7 +1029,7 @@ void LXQtResourceMonitor::updateDetailsPopup()
             }
             else if (snapshot.totalBytes == 0)
             {
-                setTextAndVisibility(details.primaryValue, tr("No swap configured"), true);
+                setTextAndVisibility(details.primaryValue, tr("No active swap"), true);
                 setVisibility(details.secondaryValue, false);
                 setVisibility(details.metricsRow, false);
                 setVisibility(details.sessionPeakRow, false);

@@ -78,12 +78,13 @@ private:
     struct ResourceSnapshot
     {
         double percent{0.0};
+        double emaPercent{0.0};
         quint64 usedBytes{0};
         quint64 totalBytes{0};
         quint64 readBytesPerSecond{0};
         quint64 writeBytesPerSecond{0};
         bool valid{false};
-        bool historyInitialized{false};
+        std::size_t historySampleCount{0};
         std::array<double, HistoryColumnCount> history{};
     };
 

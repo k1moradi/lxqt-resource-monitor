@@ -283,45 +283,83 @@ void LXQtResourceMonitor::drawMeter(QPainter &painter,
     const QColor lightColor = resourceLightColor(resource);
     const QColor darkColor = resourceDarkColor(resource);
     const ResourceSnapshot &snapshot = m_resources[resourceIndex(resource)];
-    if (snapshot.valid)
+    if (snapshot.valid && snapshot.historySampleCount > 0)
     {
-        // Each horizontal pixel column represents a load threshold. Its EMA
-        // stays bright while the live value reaches that threshold, then fades
-        // after load drops. The default 19 px meter maps one state to each pixel.
+        // Each horizontal pixel column is one EMA sample. New samples enter at
+        // the right edge while earlier samples roll left; height shows load.
         QLinearGradient gradient(meterRectangle.left(), 0, meterRectangle.right(), 0);
         gradient.setSpread(QLinearGradient::ReflectSpread);
         gradient.setColorAt(0.0, lightColor);
         gradient.setColorAt(0.5, darkColor);
         gradient.setColorAt(1.0, lightColor);
-        const int pixelColumnCount = meterRectangle.width();
-        const double thresholdStep = 100.0 / static_cast<double>(HistoryColumnCount);
-        const bool reverseProgress = m_barOrientation == TopDownBar
-            || m_barOrientation == RightToLeftBar;
+        const double historyFillRatio = static_cast<double>(snapshot.historySampleCount)
+            / static_cast<double>(HistoryColumnCount);
+        const auto valueAtPosition = [&snapshot](double position) {
+            const double boundedPosition = std::clamp(position,
+                                                       0.0,
+                                                       static_cast<double>(HistoryColumnCount - 1));
+            const std::size_t firstIndex = static_cast<std::size_t>(boundedPosition);
+            const std::size_t secondIndex = std::min(firstIndex + 1, HistoryColumnCount - 1);
+            const double fraction = boundedPosition - static_cast<double>(firstIndex);
+            return snapshot.history[firstIndex]
+                + (snapshot.history[secondIndex] - snapshot.history[firstIndex]) * fraction;
+        };
 
-        for (int pixelColumn = 0; pixelColumn < pixelColumnCount; ++pixelColumn)
+        if (isVerticalBarOrientation())
         {
-            const int progressColumn = reverseProgress
-                ? pixelColumnCount - 1 - pixelColumn
-                : pixelColumn;
-            const std::size_t historyColumn = std::min(
-                static_cast<std::size_t>(progressColumn) * HistoryColumnCount
-                    / static_cast<std::size_t>(pixelColumnCount),
-                HistoryColumnCount - 1);
-            const double threshold = (static_cast<double>(historyColumn) + 0.5) * thresholdStep;
-            const double columnOpacity = snapshot.percent >= threshold
-                ? 100.0
-                : snapshot.history[historyColumn];
-            if (columnOpacity <= 0.5)
-                continue;
+            const int columnCount = std::max(
+                1,
+                static_cast<int>(std::lround(meterRectangle.width() * historyFillRatio)));
+            const int firstColumn = meterRectangle.right() - columnCount + 1;
+            const std::size_t firstSample = HistoryColumnCount - snapshot.historySampleCount;
+            for (int column = 0; column < columnCount; ++column)
+            {
+                const double historyPosition = columnCount > 1
+                    ? static_cast<double>(firstSample) + static_cast<double>(column)
+                          * static_cast<double>(HistoryColumnCount - 1 - firstSample)
+                          / static_cast<double>(columnCount - 1)
+                    : HistoryColumnCount - 1;
+                const int filledHeight = std::clamp(
+                    static_cast<int>(std::lround(meterRectangle.height()
+                                                 * valueAtPosition(historyPosition) / 100.0)),
+                    0,
+                    meterRectangle.height());
+                if (filledHeight == 0)
+                    continue;
 
-            painter.save();
-            painter.setOpacity(std::clamp(columnOpacity / 100.0, 0.0, 1.0));
-            painter.fillRect(QRect(meterRectangle.left() + pixelColumn,
-                                   meterRectangle.top(),
-                                   1,
-                                   meterRectangle.height()),
-                             gradient);
-            painter.restore();
+                const int y = m_barOrientation == TopDownBar
+                    ? meterRectangle.top()
+                    : meterRectangle.bottom() - filledHeight + 1;
+                painter.fillRect(QRect(firstColumn + column, y, 1, filledHeight), gradient);
+            }
+        }
+        else
+        {
+            const int rowCount = std::max(
+                1,
+                static_cast<int>(std::lround(meterRectangle.height() * historyFillRatio)));
+            const int firstRow = meterRectangle.bottom() - rowCount + 1;
+            const std::size_t firstSample = HistoryColumnCount - snapshot.historySampleCount;
+            for (int row = 0; row < rowCount; ++row)
+            {
+                const double historyPosition = rowCount > 1
+                    ? static_cast<double>(firstSample) + static_cast<double>(row)
+                          * static_cast<double>(HistoryColumnCount - 1 - firstSample)
+                          / static_cast<double>(rowCount - 1)
+                    : HistoryColumnCount - 1;
+                const int filledWidth = std::clamp(
+                    static_cast<int>(std::lround(meterRectangle.width()
+                                                 * valueAtPosition(historyPosition) / 100.0)),
+                    0,
+                    meterRectangle.width());
+                if (filledWidth == 0)
+                    continue;
+
+                const int x = m_barOrientation == RightToLeftBar
+                    ? meterRectangle.right() - filledWidth + 1
+                    : meterRectangle.left();
+                painter.fillRect(QRect(x, firstRow + row, filledWidth, 1), gradient);
+            }
         }
     }
 
@@ -475,31 +513,29 @@ void LXQtResourceMonitor::updateHistory()
     {
         if (!snapshot.valid)
         {
+            snapshot.emaPercent = 0.0;
             snapshot.history.fill(0.0);
-            snapshot.historyInitialized = false;
+            snapshot.historySampleCount = 0;
             continue;
         }
 
         const double currentPercent = std::clamp(snapshot.percent, 0.0, 100.0);
-        const double thresholdStep = 100.0 / static_cast<double>(HistoryColumnCount);
-        if (!snapshot.historyInitialized)
+        if (snapshot.historySampleCount == 0)
         {
-            for (std::size_t column = 0; column < HistoryColumnCount; ++column)
-            {
-                const double threshold = (static_cast<double>(column) + 0.5) * thresholdStep;
-                snapshot.history[column] = currentPercent >= threshold ? 100.0 : 0.0;
-            }
-            snapshot.historyInitialized = true;
+            snapshot.emaPercent = currentPercent;
+            snapshot.history.fill(0.0);
+            snapshot.history.back() = currentPercent;
+            snapshot.historySampleCount = 1;
         }
         else
         {
-            for (std::size_t column = 0; column < HistoryColumnCount; ++column)
-            {
-                const double threshold = (static_cast<double>(column) + 0.5) * thresholdStep;
-                const double inputValue = currentPercent >= threshold ? 100.0 : 0.0;
-                snapshot.history[column] = snapshot.history[column] * EmaRetainedWeight
-                    + inputValue * EmaInputWeight;
-            }
+            snapshot.emaPercent = snapshot.emaPercent * EmaRetainedWeight
+                + currentPercent * EmaInputWeight;
+            for (std::size_t index = 1; index < HistoryColumnCount; ++index)
+                snapshot.history[index - 1] = snapshot.history[index];
+            snapshot.history.back() = snapshot.emaPercent;
+            snapshot.historySampleCount = std::min(snapshot.historySampleCount + 1,
+                                                   HistoryColumnCount);
         }
     }
 }

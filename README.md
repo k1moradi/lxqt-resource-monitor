@@ -7,8 +7,8 @@ The commands below assume you have already cloned this repository and are runnin
 ## Appearance and defaults
 
 - Optional meters for CPU, RAM, SWAP, local disk I/O, local network I/O and Internet I/O. CPU, RAM and SWAP are selected by default.
-- Each 19 px meter is a borderless strip of load-threshold columns. The low-to-high direction runs left-to-right by default and can be reversed.
-- At the default 19 px meter width, each pixel column tracks its own EMA. Columns matching the current load stay bright; columns from recently higher loads fade with a five-second time constant. Sampling runs once per second, and the number remains the latest live value.
+- Bottom-up vertical bars by default; top-down, left-to-right and right-to-left are configurable.
+- At the default 19 px meter width, each one-pixel-wide column is one EMA sample. New columns enter on the right and older columns roll left; column height represents the EMA. Sampling runs once per second, and the overlaid number remains the latest live value.
 - CPU is green, RAM blue, SWAP amber, disk purple, local network teal and Internet red. The meters have no borders, leaving their full width for the resource display and value text.
 - Rounded usage values are shown over the bars without a `%` postfix; tooltips retain percentages.
 - Default width is **57 px for three selected resources**, giving each bar 19 px. The widget grows or shrinks with the number of selected resources, keeping each bar the same width. The setting is configurable live from 48 to 300 px for three resources.
@@ -67,14 +67,14 @@ You can compile on one computer and install a binary `.deb` on another. The targ
 ```bash
 ./packaging/build-deb.sh \
     lxqt-panel-2.3.2/build/plugin-resourcemonitor \
-    1.0.5-1 \
+    1.0.6-1 \
     build/packages
 ```
 
-The script packages the plugin, desktop entry and capture helper; it also records the build computer's exact `lxqt-panel` package version and detects shared-library dependencies. It creates `build/packages/lxqt-resource-monitor_1.0.5-1_<architecture>.deb`. Copy that `.deb` to the other computer and install it with APT so missing runtime dependencies are fetched:
+The script packages the plugin, desktop entry and capture helper; it also records the build computer's exact `lxqt-panel` package version and detects shared-library dependencies. It creates `build/packages/lxqt-resource-monitor_1.0.6-1_<architecture>.deb`. Copy that `.deb` to the other computer and install it with APT so missing runtime dependencies are fetched:
 
 ```bash
-sudo apt install ./build/packages/lxqt-resource-monitor_1.0.5-1_$(dpkg --print-architecture).deb
+sudo apt install ./build/packages/lxqt-resource-monitor_1.0.6-1_$(dpkg --print-architecture).deb
 ```
 
 The `.deb` is architecture and Ubuntu-release specific. Build and install it on computers with the same CPU architecture, Ubuntu/Lubuntu release and exact `lxqt-panel` package version; the plugin uses LXQt Panel's private plugin interface. The package's post-install step gives only `resourcemonitor-netcap` the `CAP_NET_RAW` capability needed for IP-based local-versus-public traffic counts. No source-package repositories are needed on the target computer. After installation, restart LXQt Panel and add **Resource Monitor** in **Panel Settings → Widgets**. To remove the package, run `sudo apt remove lxqt-resource-monitor`.
@@ -82,7 +82,7 @@ The `.deb` is architecture and Ubuntu-release specific. Build and install it on 
 You can also download the prebuilt `.deb` for the supported amd64 system from the [latest GitHub release](https://github.com/k1moradi/lxqt-resource-monitor/releases/latest). Install the downloaded package with:
 
 ```bash
-sudo apt install ./lxqt-resource-monitor_1.0.5-1_amd64.deb
+sudo apt install ./lxqt-resource-monitor_1.0.6-1_amd64.deb
 ```
 
 ## Install for all users

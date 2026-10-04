@@ -66,13 +66,6 @@ sudo apt install ./build/packages/lxqt-resource-monitor-netcap_1.0.8-1_$(dpkg --
 
 The build script records the build computer's exact `lxqt-panel` package version and detects shared-library dependencies. APT fetches missing runtime packages during installation. The packages are architecture and Ubuntu-release specific, and require the same `lxqt-panel` package version as the build computer. After installation, restart LXQt Panel and add **Resource Monitor** in **Panel Settings → Widgets**. To remove both packages, run `sudo apt remove lxqt-resource-monitor lxqt-resource-monitor-netcap`.
 
-You can also download the prebuilt amd64 packages from the [latest GitHub release](https://github.com/k1moradi/lxqt-resource-monitor/releases/latest). Install the main package, and the optional helper if you use network meters:
-
-```bash
-sudo apt install ./lxqt-resource-monitor_1.0.8-1_amd64.deb
-sudo apt install ./lxqt-resource-monitor-netcap_1.0.8-1_amd64.deb
-```
-
 ## Install for all users
 
 The Debian packages handle shared-library dependencies and helper capabilities automatically. For a manual plugin-only install, use the build output path below. This leaves the packaged `lxqt-panel` executable and existing plugins unchanged:

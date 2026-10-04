@@ -88,8 +88,6 @@ void LXQtResourceMonitorConfiguration::fillBarOrientations()
 {
     m_ui->barOrientationCOB->addItem(tr("Bottom up"), QStringLiteral("bottomUp"));
     m_ui->barOrientationCOB->addItem(tr("Top down"), QStringLiteral("topDown"));
-    m_ui->barOrientationCOB->addItem(tr("Left to right"), QStringLiteral("leftRight"));
-    m_ui->barOrientationCOB->addItem(tr("Right to left"), QStringLiteral("rightLeft"));
 }
 
 void LXQtResourceMonitorConfiguration::loadSettings()

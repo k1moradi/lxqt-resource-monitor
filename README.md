@@ -7,8 +7,7 @@ The commands below assume you have already cloned this repository and are runnin
 ## Appearance and defaults
 
 - Optional meters for CPU, RAM, SWAP, local disk I/O, local network I/O and Internet I/O. CPU, RAM and SWAP are selected by default.
-- Bottom-up vertical bars by default; top-down, left-to-right and right-to-left are configurable.
-- At the default 19 px meter width, each one-pixel-wide column is one EMA sample. New columns enter on the right and older columns roll left; column height represents the EMA. Sampling runs once per second, and the overlaid number remains the latest live value.
+- Bottom-up vertical columns by default; top-down changes which edge represents zero. Each one-pixel-wide column is one EMA sample. New columns enter on the right and older columns roll left; column height represents the EMA. The newest column is brighter to make the rolling direction visible. At the default 19 px per resource, the graph shows the latest 19 one-second EMA samples. The overlaid number remains the latest live value.
 - CPU is green, RAM blue, SWAP amber, disk purple, local network teal and Internet red. The meters have no borders, leaving their full width for the resource display and value text.
 - Rounded usage values are shown over the bars without a `%` postfix; tooltips retain percentages.
 - Default width is **57 px for three selected resources**, giving each bar 19 px. The widget grows or shrinks with the number of selected resources, keeping each bar the same width. The setting is configurable live from 48 to 300 px for three resources.
@@ -21,7 +20,7 @@ RAM usage uses libstatgrab's `used / total` values. On Linux, libstatgrab treats
 
 ## Run the CTests
 
-The CTests cover resource formatting, the CPU sample validity rule, and a live libstatgrab CPU query. The regression test includes the libstatgrab 0.92 behavior where a non-null aggregate CPU sample reports zero entries. On Ubuntu/Lubuntu:
+The CTests cover resource formatting, CPU sample validity, live libstatgrab sampling, EMA history ordering and pixel-column mapping, and IPv4/IPv6 traffic classification including malformed packets and address-range boundaries. The CPU regression test includes the libstatgrab 0.92 behavior where a non-null aggregate CPU sample reports zero entries. On Ubuntu/Lubuntu:
 
 ```bash
 sudo apt install build-essential cmake ninja-build qt6-base-dev libstatgrab-dev
@@ -32,80 +31,68 @@ ctest --test-dir build --output-on-failure
 
 ## Build the LXQt Panel plugin
 
-The plugin uses the same private panel interfaces as the bundled LXQt plugins, so build it against an LXQt Panel 2.3.2 source tree. The included patch adds the plugin to the upstream CMake build and install lists. Run all commands below from the `lxqt-resource-monitor/` folder.
+The plugin uses private headers from LXQt Panel 2.3.2. The build script downloads that source and compiles only the resource monitor with a small standalone CMake project; it does not configure or build LXQt Panel or its other plugins. Run these commands from the `lxqt-resource-monitor/` folder.
 
-Install the build dependencies using Ubuntu's package metadata:
+Install the build dependencies directly. This does not require source-package (`deb-src`) entries:
 
 ```bash
 sudo apt update
-sudo apt install build-essential cmake ninja-build git devscripts dpkg-dev libstatgrab-dev libcap2-bin
-sudo apt build-dep lxqt-panel
+sudo apt install build-essential cmake ninja-build git dpkg-dev qt6-base-dev libkf6windowsystem-dev liblxqt2-dev libstatgrab-dev
 ```
 
-If `apt build-dep` prints `You must put some 'deb-src' URIs in your sources.list`, enable source-package entries on the **build computer**. The default Lubuntu 26.04 setup uses `/etc/apt/sources.list.d/ubuntu.sources`: edit each Ubuntu archive and security stanza, changing `Types: deb` to `Types: deb deb-src`, then run `sudo apt update` and retry `sudo apt build-dep lxqt-panel`. Keep each stanza's existing URI, suite, components and signing key. For older one-line `.list` files, add a matching `deb-src` line for each Ubuntu `deb` line. APT uses `deb-src` entries to retrieve source package metadata for `build-dep` ([APT sources.list manual](https://manpages.ubuntu.com/manpages/resolute/man5/sources.list.5.html)).
-
-Apply the patch to a clean upstream checkout:
+Then build and package the plugin with one command:
 
 ```bash
-git clone --depth 1 --branch 2.3.2 https://github.com/lxqt/lxqt-panel.git lxqt-panel-2.3.2
-git -C lxqt-panel-2.3.2 apply "$PWD/lxqt-panel-2.3.2-resourcemonitor.patch"
+./packaging/build.sh
 ```
 
-Configure and build just the new plugin:
-
-```bash
-cmake -S lxqt-panel-2.3.2 -B lxqt-panel-2.3.2/build -G Ninja -DCMAKE_BUILD_TYPE=RelWithDebInfo
-cmake --build lxqt-panel-2.3.2/build --target resourcemonitor resourcemonitor-netcap
-```
-
-The resulting files are in `lxqt-panel-2.3.2/build/plugin-resourcemonitor/`.
+The packages are written to `build/packages/`; intermediate build files are in `build/lxqt-panel-2.3.2-resource-monitor/`. On x86-64, the plugin and helper are compiled for the x86-64 baseline with SSSE3 enabled and SSE4.1, SSE4.2, and AVX disabled. A newer build host therefore cannot silently produce binaries that require those newer instructions. Other architectures use their toolchain's default target.
 
 ## Build a binary Debian package
 
-You can compile on one computer and install a binary `.deb` on another. The target computer does not need `deb-src`, a compiler, or the LXQt Panel source tree. Build the plugin as above, then, from this repository, run:
+You can compile on one computer and install binary `.deb` files on another. The target computer does not need `deb-src`, a compiler, or the LXQt Panel source tree. The `lxqt-resource-monitor` package contains the panel plugin. The separate `lxqt-resource-monitor-netcap` package is optional and is needed only for Local net and Internet traffic meters.
+
+Install the base plugin package:
 
 ```bash
-./packaging/build-deb.sh \
-    lxqt-panel-2.3.2/build/plugin-resourcemonitor \
-    1.0.6-1 \
-    build/packages
+sudo apt install ./build/packages/lxqt-resource-monitor_1.0.8-1_$(dpkg --print-architecture).deb
 ```
 
-The script packages the plugin, desktop entry and capture helper; it also records the build computer's exact `lxqt-panel` package version and detects shared-library dependencies. It creates `build/packages/lxqt-resource-monitor_1.0.6-1_<architecture>.deb`. Copy that `.deb` to the other computer and install it with APT so missing runtime dependencies are fetched:
+For IP-based Local net and Internet meters, also install the optional helper package:
 
 ```bash
-sudo apt install ./build/packages/lxqt-resource-monitor_1.0.6-1_$(dpkg --print-architecture).deb
+sudo apt install ./build/packages/lxqt-resource-monitor-netcap_1.0.8-1_$(dpkg --print-architecture).deb
 ```
 
-The `.deb` is architecture and Ubuntu-release specific. Build and install it on computers with the same CPU architecture, Ubuntu/Lubuntu release and exact `lxqt-panel` package version; the plugin uses LXQt Panel's private plugin interface. The package's post-install step gives only `resourcemonitor-netcap` the `CAP_NET_RAW` capability needed for IP-based local-versus-public traffic counts. No source-package repositories are needed on the target computer. After installation, restart LXQt Panel and add **Resource Monitor** in **Panel Settings → Widgets**. To remove the package, run `sudo apt remove lxqt-resource-monitor`.
+The build script records the build computer's exact `lxqt-panel` package version and detects shared-library dependencies. APT fetches missing runtime packages during installation. The packages are architecture and Ubuntu-release specific, and require the same `lxqt-panel` package version as the build computer. After installation, restart LXQt Panel and add **Resource Monitor** in **Panel Settings → Widgets**. To remove both packages, run `sudo apt remove lxqt-resource-monitor lxqt-resource-monitor-netcap`.
 
-You can also download the prebuilt `.deb` for the supported amd64 system from the [latest GitHub release](https://github.com/k1moradi/lxqt-resource-monitor/releases/latest). Install the downloaded package with:
+You can also download the prebuilt amd64 packages from the [latest GitHub release](https://github.com/k1moradi/lxqt-resource-monitor/releases/latest). Install the main package, and the optional helper if you use network meters:
 
 ```bash
-sudo apt install ./lxqt-resource-monitor_1.0.6-1_amd64.deb
+sudo apt install ./lxqt-resource-monitor_1.0.8-1_amd64.deb
+sudo apt install ./lxqt-resource-monitor-netcap_1.0.8-1_amd64.deb
 ```
 
 ## Install for all users
 
-Install the plugin module and desktop metadata into LXQt's plugin paths. This leaves the packaged `lxqt-panel` executable and existing plugins unchanged:
+The Debian packages handle shared-library dependencies and helper capabilities automatically. For a manual plugin-only install, use the build output path below. This leaves the packaged `lxqt-panel` executable and existing plugins unchanged:
 
 ```bash
 MULTIARCH="$(dpkg-architecture -qDEB_HOST_MULTIARCH)"
-sudo install -Dm755 \
-    lxqt-panel-2.3.2/build/plugin-resourcemonitor/libresourcemonitor.so \
-    "/usr/lib/${MULTIARCH}/lxqt-panel/libresourcemonitor.so"
-sudo install -Dm644 \
-    lxqt-panel-2.3.2/build/plugin-resourcemonitor/resourcemonitor.desktop \
-    /usr/share/lxqt/lxqt-panel/resourcemonitor.desktop
-sudo install -Dm755 \
-    lxqt-panel-2.3.2/build/plugin-resourcemonitor/resourcemonitor-netcap \
-    /usr/bin/resourcemonitor-netcap
-sudo chown root:root /usr/bin/resourcemonitor-netcap
-sudo setcap cap_net_raw=ep /usr/bin/resourcemonitor-netcap
-getcap /usr/bin/resourcemonitor-netcap
+PLUGIN_BUILD="build/lxqt-panel-2.3.2-resource-monitor/plugin-resourcemonitor"
+sudo install -Dm755 "$PLUGIN_BUILD/libresourcemonitor.so" "/usr/lib/${MULTIARCH}/lxqt-panel/libresourcemonitor.so"
+sudo install -Dm644 "$PLUGIN_BUILD/resourcemonitor.desktop" /usr/share/lxqt/lxqt-panel/resourcemonitor.desktop
 ```
 
-Restart the LXQt Panel or sign out and back in to make it rescan plugins. Then open **Panel Settings → Widgets**, choose **Add**, and select **Resource Monitor**. Its settings dialog controls enabled resources, value text, update interval, bar orientation and width; changes apply live.
+For Local net and Internet meters only, also install the capture helper and grant its network capability:
+
+```bash
+sudo install -Dm755 "$PLUGIN_BUILD/resourcemonitor-netcap" /usr/bin/resourcemonitor-netcap
+sudo chown root:root /usr/bin/resourcemonitor-netcap
+sudo setcap cap_net_raw=ep /usr/bin/resourcemonitor-netcap
+```
+
+Restart the LXQt Panel or sign out and back in to make it rescan plugins. Then open **Panel Settings → Widgets**, choose **Add**, and select **Resource Monitor**. Its settings dialog controls enabled resources, value text, update interval, EMA column height direction, and width; changes apply live.
 
 To remove the all-users installation:
 
@@ -118,7 +105,7 @@ sudo rm -f /usr/bin/resourcemonitor-netcap
 
 ## First visual check
 
-Try the default **57 px** width with CPU, RAM and SWAP selected, and check whether the three-digit `100` fits comfortably at your panel height. Enable the optional disk and network meters from the settings dialog. Network meters remain unavailable until the capture helper is installed with `CAP_NET_RAW` as described above.
+Try the default **57 px** width with CPU, RAM and SWAP selected. The three resource meters are each 19 pixels wide, with the latest EMA column at the right and older columns moving left. The overlaid number shows the current live value. Enable the optional disk and network meters from the settings dialog. Network meters require the optional capture helper with `CAP_NET_RAW`.
 
 ## License
 

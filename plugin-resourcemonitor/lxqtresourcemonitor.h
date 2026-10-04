@@ -25,6 +25,7 @@
 #include <QFrame>
 #include <QProcess>
 #include <QByteArray>
+#include "resourcemonitorhistory.h"
 #include <array>
 #include <cstddef>
 
@@ -43,9 +44,7 @@ public:
     enum BarOrientation
     {
         BottomUpBar,
-        TopDownBar,
-        RightToLeftBar,
-        LeftToRightBar
+        TopDownBar
     };
 
     explicit LXQtResourceMonitor(ILXQtPanelPlugin *plugin, QWidget *parent = nullptr);
@@ -73,19 +72,15 @@ private:
         Count
     };
 
-    static constexpr std::size_t HistoryColumnCount = 19;
-
     struct ResourceSnapshot
     {
         double percent{0.0};
-        double emaPercent{0.0};
         quint64 usedBytes{0};
         quint64 totalBytes{0};
         quint64 readBytesPerSecond{0};
         quint64 writeBytesPerSecond{0};
         bool valid{false};
-        std::size_t historySampleCount{0};
-        std::array<double, HistoryColumnCount> history{};
+        ResourceMonitorHistory::RollingEma history;
     };
 
     static constexpr std::size_t ResourceCount = static_cast<std::size_t>(Resource::Count);
@@ -104,7 +99,6 @@ private:
 
     [[nodiscard]] bool isResourceEnabled(Resource resource) const;
     [[nodiscard]] int enabledResourceCount() const;
-    [[nodiscard]] bool isVerticalBarOrientation() const;
     [[nodiscard]] QRect meterRect(int meterIndex, int meterCount) const;
     [[nodiscard]] QColor resourceLightColor(Resource resource) const;
     [[nodiscard]] QColor resourceDarkColor(Resource resource) const;

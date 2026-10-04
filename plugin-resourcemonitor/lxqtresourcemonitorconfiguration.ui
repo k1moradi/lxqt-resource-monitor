@@ -110,12 +110,16 @@
       <item row="2" column="0">
        <widget class="QLabel" name="barOrientationLabel">
         <property name="text">
-         <string>Bar orientation:</string>
+         <string>Column height:</string>
         </property>
        </widget>
       </item>
       <item row="2" column="1">
-       <widget class="QComboBox" name="barOrientationCOB"/>
+       <widget class="QComboBox" name="barOrientationCOB">
+        <property name="toolTip">
+         <string>Each horizontal pixel is one EMA sample. New samples enter on the right and older samples roll left.</string>
+        </property>
+       </widget>
       </item>
       <item row="3" column="0">
        <widget class="QLabel" name="widgetWidthLabel">

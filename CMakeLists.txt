@@ -1,5 +1,5 @@
 cmake_minimum_required(VERSION 3.18)
-project(lxqt-resource-monitor VERSION 0.1.0 LANGUAGES CXX)
+project(lxqt-resource-monitor VERSION 1.0.8 LANGUAGES CXX)
 
 include(CTest)
 
@@ -23,6 +23,24 @@ if(BUILD_TESTING)
     target_link_libraries(resourcemonitor-math-test PRIVATE resourcemonitormath)
 
     add_test(NAME resourcemonitor-math COMMAND resourcemonitor-math-test)
+
+    add_executable(resourcemonitor-history-test
+        tests/resource_monitor_history_test.cpp
+    )
+    target_include_directories(resourcemonitor-history-test
+        PRIVATE plugin-resourcemonitor
+    )
+    target_compile_features(resourcemonitor-history-test PRIVATE cxx_std_17)
+    add_test(NAME resourcemonitor-history COMMAND resourcemonitor-history-test)
+
+    add_executable(resourcemonitor-packet-test
+        tests/resource_monitor_packet_test.cpp
+    )
+    target_include_directories(resourcemonitor-packet-test
+        PRIVATE plugin-resourcemonitor
+    )
+    target_compile_features(resourcemonitor-packet-test PRIVATE cxx_std_17)
+    add_test(NAME resourcemonitor-packet COMMAND resourcemonitor-packet-test)
 
     add_executable(resourcemonitor-cpu-sampling-test
         tests/resource_monitor_cpu_sampling_test.cpp

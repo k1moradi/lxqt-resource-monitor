@@ -22,10 +22,10 @@ index f731bfb..c1e5879 100644
      list(APPEND ENABLED_PLUGINS "Custom Command")
 diff --git a/plugin-resourcemonitor/CMakeLists.txt b/plugin-resourcemonitor/CMakeLists.txt
 new file mode 100644
-index 0000000..2ca7935
+index 0000000..95c109f
 --- /dev/null
 +++ b/plugin-resourcemonitor/CMakeLists.txt
-@@ -0,0 +1,28 @@
+@@ -0,0 +1,69 @@
 +set(PLUGIN "resourcemonitor")
 +
 +set(HEADERS
@@ -33,6 +33,8 @@ index 0000000..2ca7935
 +    lxqtresourcemonitor.h
 +    lxqtresourcemonitorconfiguration.h
 +    resourcemonitormath.h
++    resourcemonitorhistory.h
++    resourcemonitorpacket.h
 +)
 +
 +set(SOURCES
@@ -48,18 +50,57 @@ index 0000000..2ca7935
 +
 +set(LIBRARIES ${STATGRAB_LIB})
 +
-+BUILD_LXQT_PLUGIN(${PLUGIN})
++if(COMMAND BUILD_LXQT_PLUGIN)
++    # Full LXQt Panel source-tree build.
++    BUILD_LXQT_PLUGIN(${PLUGIN})
++else()
++    # Lightweight package build: compile only this module against the panel's
++    # private headers without configuring the panel or its unrelated plugins.
++    if(NOT LXQT_PANEL_SOURCE_DIR
++       OR NOT EXISTS "${LXQT_PANEL_SOURCE_DIR}/panel/ilxqtpanelplugin.h")
++        message(FATAL_ERROR "Set LXQT_PANEL_SOURCE_DIR to an LXQt Panel source tree")
++    endif()
++
++    add_library(${PLUGIN} MODULE ${HEADERS} ${SOURCES} ${UIS})
++    target_include_directories(${PLUGIN} PRIVATE
++        "${LXQT_PANEL_SOURCE_DIR}/panel"
++        ${STATGRAB_INCLUDE_DIR}
++    )
++    target_compile_features(${PLUGIN} PRIVATE cxx_std_17)
++    target_compile_options(${PLUGIN} PRIVATE -Wall -Wextra -Wpedantic)
++    target_link_libraries(${PLUGIN} PRIVATE Qt6::Widgets lxqt ${LIBRARIES})
++
++    configure_file(resources/resourcemonitor.desktop
++        "${CMAKE_CURRENT_BINARY_DIR}/resourcemonitor.desktop" COPYONLY)
++endif()
 +
 +add_executable(resourcemonitor-netcap resourcemonitor-netcap.cpp)
 +target_compile_features(resourcemonitor-netcap PRIVATE cxx_std_17)
 +target_compile_options(resourcemonitor-netcap PRIVATE -Wall -Wextra -Wpedantic)
++
++# Keep x86-64 builds usable on older processors: permit SSSE3, but do not let
++# a build host with a newer CPU introduce SSE4.1, AVX, or later instructions.
++if(CMAKE_CXX_COMPILER_ID MATCHES "GNU|Clang"
++   AND CMAKE_SYSTEM_PROCESSOR MATCHES "^(x86_64|AMD64|amd64)$")
++    set(RESOURCEMONITOR_X86_FLAGS
++        -march=x86-64
++        -mtune=generic
++        -mssse3
++        -mno-sse4.1
++        -mno-sse4.2
++        -mno-avx
++    )
++    target_compile_options(resourcemonitor PRIVATE ${RESOURCEMONITOR_X86_FLAGS})
++    target_compile_options(resourcemonitor-netcap PRIVATE ${RESOURCEMONITOR_X86_FLAGS})
++endif()
++
 +install(TARGETS resourcemonitor-netcap RUNTIME DESTINATION bin)
 diff --git a/plugin-resourcemonitor/lxqtresourcemonitor.cpp b/plugin-resourcemonitor/lxqtresourcemonitor.cpp
 new file mode 100644
-index 0000000..8d857dc
+index 0000000..4a09f00
 --- /dev/null
 +++ b/plugin-resourcemonitor/lxqtresourcemonitor.cpp
-@@ -0,0 +1,804 @@
+@@ -0,0 +1,702 @@
 +/* BEGIN_COMMON_COPYRIGHT_HEADER
 + * (c)LGPL2+
 + *
@@ -87,7 +128,6 @@ index 0000000..8d857dc
 +#include <QDebug>
 +#include <QFontMetrics>
 +#include <QHBoxLayout>
-+#include <QLinearGradient>
 +#include <QPainter>
 +#include <QPalette>
 +#include <QStandardPaths>
@@ -110,19 +150,12 @@ index 0000000..8d857dc
 +namespace
 +{
 +constexpr auto BarOrientTopDown = "topDown";
-+constexpr auto BarOrientLeftRight = "leftRight";
-+constexpr auto BarOrientRightLeft = "rightLeft";
 +
 +constexpr int OuterMargin = 0;
 +constexpr int MeterGap = 0;
 +constexpr int TextHorizontalPadding = 0;
 +constexpr int PreferredTextPixelSize = 10;
 +constexpr int MinimumTextPixelSize = 7;
-+
-+// The one-second sampler uses a five-second EMA time constant. Cache both
-+// weights so no exponential calculation is needed in the sampling loop.
-+constexpr double EmaInputWeight = 0.18126924692201818;
-+constexpr double EmaRetainedWeight = 0.8187307530779818;
 +
 +} // namespace
 +
@@ -206,11 +239,6 @@ index 0000000..8d857dc
 +        sg_shutdown();
 +}
 +
-+bool LXQtResourceMonitor::isVerticalBarOrientation() const
-+{
-+    return m_barOrientation == BottomUpBar || m_barOrientation == TopDownBar;
-+}
-+
 +bool LXQtResourceMonitor::isResourceEnabled(Resource resource) const
 +{
 +    return m_enabledResources[resourceIndex(resource)];
@@ -246,30 +274,16 @@ index 0000000..8d857dc
 +    if (availableRectangle.isEmpty() || meterCount <= 0 || meterIndex < 0 || meterIndex >= meterCount)
 +        return {};
 +
-+    if (isVerticalBarOrientation())
-+    {
-+        const int usableWidth = std::max(0, availableRectangle.width() - MeterGap * (meterCount - 1));
-+        const int baseWidth = usableWidth / meterCount;
-+        const int remainder = usableWidth % meterCount;
++    const int usableWidth = std::max(0, availableRectangle.width() - MeterGap * (meterCount - 1));
++    const int baseWidth = usableWidth / meterCount;
++    const int remainder = usableWidth % meterCount;
 +
-+        int x = availableRectangle.left();
-+        for (int index = 0; index < meterIndex; ++index)
-+            x += baseWidth + (index < remainder ? 1 : 0) + MeterGap;
-+
-+        const int width = baseWidth + (meterIndex < remainder ? 1 : 0);
-+        return QRect(x, availableRectangle.top(), width, availableRectangle.height());
-+    }
-+
-+    const int usableHeight = std::max(0, availableRectangle.height() - MeterGap * (meterCount - 1));
-+    const int baseHeight = usableHeight / meterCount;
-+    const int remainder = usableHeight % meterCount;
-+
-+    int y = availableRectangle.top();
++    int x = availableRectangle.left();
 +    for (int index = 0; index < meterIndex; ++index)
-+        y += baseHeight + (index < remainder ? 1 : 0) + MeterGap;
++        x += baseWidth + (index < remainder ? 1 : 0) + MeterGap;
 +
-+    const int height = baseHeight + (meterIndex < remainder ? 1 : 0);
-+    return QRect(availableRectangle.left(), y, availableRectangle.width(), height);
++    const int width = baseWidth + (meterIndex < remainder ? 1 : 0);
++    return QRect(x, availableRectangle.top(), width, availableRectangle.height());
 +}
 +
 +QColor LXQtResourceMonitor::resourceLightColor(Resource resource) const
@@ -342,86 +356,34 @@ index 0000000..8d857dc
 +    if (meterRectangle.isEmpty())
 +        return;
 +
-+    const QColor lightColor = resourceLightColor(resource);
++    QColor newestColumnColor = resourceLightColor(resource);
++    newestColumnColor.setAlpha(255);
 +    const QColor darkColor = resourceDarkColor(resource);
 +    const ResourceSnapshot &snapshot = m_resources[resourceIndex(resource)];
-+    if (snapshot.valid && snapshot.historySampleCount > 0)
++    if (snapshot.valid && snapshot.history.sampleCount() > 0)
 +    {
-+        // Each horizontal pixel column is one EMA sample. New samples enter at
-+        // the right edge while earlier samples roll left; height shows load.
-+        QLinearGradient gradient(meterRectangle.left(), 0, meterRectangle.right(), 0);
-+        gradient.setSpread(QLinearGradient::ReflectSpread);
-+        gradient.setColorAt(0.0, lightColor);
-+        gradient.setColorAt(0.5, darkColor);
-+        gradient.setColorAt(1.0, lightColor);
-+        const double historyFillRatio = static_cast<double>(snapshot.historySampleCount)
-+            / static_cast<double>(HistoryColumnCount);
-+        const auto valueAtPosition = [&snapshot](double position) {
-+            const double boundedPosition = std::clamp(position,
-+                                                       0.0,
-+                                                       static_cast<double>(HistoryColumnCount - 1));
-+            const std::size_t firstIndex = static_cast<std::size_t>(boundedPosition);
-+            const std::size_t secondIndex = std::min(firstIndex + 1, HistoryColumnCount - 1);
-+            const double fraction = boundedPosition - static_cast<double>(firstIndex);
-+            return snapshot.history[firstIndex]
-+                + (snapshot.history[secondIndex] - snapshot.history[firstIndex]) * fraction;
-+        };
-+
-+        if (isVerticalBarOrientation())
++        // Each 1-pixel column is one EMA sample. The newest is on the right,
++        // and every update advances the older columns one pixel to the left.
++        const ResourceMonitorHistory::VisibleWindow window =
++            snapshot.history.visibleWindow(meterRectangle.width());
++        for (std::size_t column = 0; column < window.columnCount; ++column)
 +        {
-+            const int columnCount = std::max(
-+                1,
-+                static_cast<int>(std::lround(meterRectangle.width() * historyFillRatio)));
-+            const int firstColumn = meterRectangle.right() - columnCount + 1;
-+            const std::size_t firstSample = HistoryColumnCount - snapshot.historySampleCount;
-+            for (int column = 0; column < columnCount; ++column)
-+            {
-+                const double historyPosition = columnCount > 1
-+                    ? static_cast<double>(firstSample) + static_cast<double>(column)
-+                          * static_cast<double>(HistoryColumnCount - 1 - firstSample)
-+                          / static_cast<double>(columnCount - 1)
-+                    : HistoryColumnCount - 1;
-+                const int filledHeight = std::clamp(
-+                    static_cast<int>(std::lround(meterRectangle.height()
-+                                                 * valueAtPosition(historyPosition) / 100.0)),
-+                    0,
-+                    meterRectangle.height());
-+                if (filledHeight == 0)
-+                    continue;
++            const int filledHeight = std::clamp(
++                static_cast<int>(std::lround(meterRectangle.height()
++                                             * snapshot.history.sampleAt(window.sampleStart + column) / 100.0)),
++                0,
++                meterRectangle.height());
++            if (filledHeight == 0)
++                continue;
 +
-+                const int y = m_barOrientation == TopDownBar
-+                    ? meterRectangle.top()
-+                    : meterRectangle.bottom() - filledHeight + 1;
-+                painter.fillRect(QRect(firstColumn + column, y, 1, filledHeight), gradient);
-+            }
-+        }
-+        else
-+        {
-+            const int rowCount = std::max(
-+                1,
-+                static_cast<int>(std::lround(meterRectangle.height() * historyFillRatio)));
-+            const int firstRow = meterRectangle.bottom() - rowCount + 1;
-+            const std::size_t firstSample = HistoryColumnCount - snapshot.historySampleCount;
-+            for (int row = 0; row < rowCount; ++row)
-+            {
-+                const double historyPosition = rowCount > 1
-+                    ? static_cast<double>(firstSample) + static_cast<double>(row)
-+                          * static_cast<double>(HistoryColumnCount - 1 - firstSample)
-+                          / static_cast<double>(rowCount - 1)
-+                    : HistoryColumnCount - 1;
-+                const int filledWidth = std::clamp(
-+                    static_cast<int>(std::lround(meterRectangle.width()
-+                                                 * valueAtPosition(historyPosition) / 100.0)),
-+                    0,
-+                    meterRectangle.width());
-+                if (filledWidth == 0)
-+                    continue;
-+
-+                const int x = m_barOrientation == RightToLeftBar
-+                    ? meterRectangle.right() - filledWidth + 1
-+                    : meterRectangle.left();
-+                painter.fillRect(QRect(x, firstRow + row, filledWidth, 1), gradient);
-+            }
++            const int x = meterRectangle.left() + window.firstColumn + static_cast<int>(column);
++            const int y = m_barOrientation == TopDownBar
++                ? meterRectangle.top()
++                : meterRectangle.bottom() - filledHeight + 1;
++            const QColor &columnColor = column + 1 == window.columnCount
++                ? newestColumnColor
++                : darkColor;
++            painter.fillRect(QRect(x, y, 1, filledHeight), columnColor);
 +        }
 +    }
 +
@@ -575,30 +537,11 @@ index 0000000..8d857dc
 +    {
 +        if (!snapshot.valid)
 +        {
-+            snapshot.emaPercent = 0.0;
-+            snapshot.history.fill(0.0);
-+            snapshot.historySampleCount = 0;
++            snapshot.history.update(0.0, false);
 +            continue;
 +        }
 +
-+        const double currentPercent = std::clamp(snapshot.percent, 0.0, 100.0);
-+        if (snapshot.historySampleCount == 0)
-+        {
-+            snapshot.emaPercent = currentPercent;
-+            snapshot.history.fill(0.0);
-+            snapshot.history.back() = currentPercent;
-+            snapshot.historySampleCount = 1;
-+        }
-+        else
-+        {
-+            snapshot.emaPercent = snapshot.emaPercent * EmaRetainedWeight
-+                + currentPercent * EmaInputWeight;
-+            for (std::size_t index = 1; index < HistoryColumnCount; ++index)
-+                snapshot.history[index - 1] = snapshot.history[index];
-+            snapshot.history.back() = snapshot.emaPercent;
-+            snapshot.historySampleCount = std::min(snapshot.historySampleCount + 1,
-+                                                   HistoryColumnCount);
-+        }
++        snapshot.history.update(snapshot.percent, true);
 +    }
 +}
 +
@@ -850,11 +793,7 @@ index 0000000..8d857dc
 +        ->value(QStringLiteral("barOrientation"), QStringLiteral("bottomUp"))
 +        .toString();
 +
-+    if (barOrientation == QLatin1String(BarOrientRightLeft))
-+        m_barOrientation = RightToLeftBar;
-+    else if (barOrientation == QLatin1String(BarOrientLeftRight))
-+        m_barOrientation = LeftToRightBar;
-+    else if (barOrientation == QLatin1String(BarOrientTopDown))
++    if (barOrientation == QLatin1String(BarOrientTopDown))
 +        m_barOrientation = TopDownBar;
 +    else
 +        m_barOrientation = BottomUpBar;
@@ -866,10 +805,10 @@ index 0000000..8d857dc
 +}
 diff --git a/plugin-resourcemonitor/lxqtresourcemonitor.h b/plugin-resourcemonitor/lxqtresourcemonitor.h
 new file mode 100644
-index 0000000..f80a9dc
+index 0000000..c4b6111
 --- /dev/null
 +++ b/plugin-resourcemonitor/lxqtresourcemonitor.h
-@@ -0,0 +1,148 @@
+@@ -0,0 +1,142 @@
 +/* BEGIN_COMMON_COPYRIGHT_HEADER
 + * (c)LGPL2+
 + *
@@ -897,6 +836,7 @@ index 0000000..f80a9dc
 +#include <QFrame>
 +#include <QProcess>
 +#include <QByteArray>
++#include "resourcemonitorhistory.h"
 +#include <array>
 +#include <cstddef>
 +
@@ -915,9 +855,7 @@ index 0000000..f80a9dc
 +    enum BarOrientation
 +    {
 +        BottomUpBar,
-+        TopDownBar,
-+        RightToLeftBar,
-+        LeftToRightBar
++        TopDownBar
 +    };
 +
 +    explicit LXQtResourceMonitor(ILXQtPanelPlugin *plugin, QWidget *parent = nullptr);
@@ -945,19 +883,15 @@ index 0000000..f80a9dc
 +        Count
 +    };
 +
-+    static constexpr std::size_t HistoryColumnCount = 19;
-+
 +    struct ResourceSnapshot
 +    {
 +        double percent{0.0};
-+        double emaPercent{0.0};
 +        quint64 usedBytes{0};
 +        quint64 totalBytes{0};
 +        quint64 readBytesPerSecond{0};
 +        quint64 writeBytesPerSecond{0};
 +        bool valid{false};
-+        std::size_t historySampleCount{0};
-+        std::array<double, HistoryColumnCount> history{};
++        ResourceMonitorHistory::RollingEma history;
 +    };
 +
 +    static constexpr std::size_t ResourceCount = static_cast<std::size_t>(Resource::Count);
@@ -976,7 +910,6 @@ index 0000000..f80a9dc
 +
 +    [[nodiscard]] bool isResourceEnabled(Resource resource) const;
 +    [[nodiscard]] int enabledResourceCount() const;
-+    [[nodiscard]] bool isVerticalBarOrientation() const;
 +    [[nodiscard]] QRect meterRect(int meterIndex, int meterCount) const;
 +    [[nodiscard]] QColor resourceLightColor(Resource resource) const;
 +    [[nodiscard]] QColor resourceDarkColor(Resource resource) const;
@@ -1020,10 +953,10 @@ index 0000000..f80a9dc
 +#endif // LXQTRESOURCEMONITOR_H
 diff --git a/plugin-resourcemonitor/lxqtresourcemonitorconfiguration.cpp b/plugin-resourcemonitor/lxqtresourcemonitorconfiguration.cpp
 new file mode 100644
-index 0000000..9ebf638
+index 0000000..e277e3c
 --- /dev/null
 +++ b/plugin-resourcemonitor/lxqtresourcemonitorconfiguration.cpp
-@@ -0,0 +1,144 @@
+@@ -0,0 +1,142 @@
 +/* BEGIN_COMMON_COPYRIGHT_HEADER
 + * (c)LGPL2+
 + *
@@ -1114,8 +1047,6 @@ index 0000000..9ebf638
 +{
 +    m_ui->barOrientationCOB->addItem(tr("Bottom up"), QStringLiteral("bottomUp"));
 +    m_ui->barOrientationCOB->addItem(tr("Top down"), QStringLiteral("topDown"));
-+    m_ui->barOrientationCOB->addItem(tr("Left to right"), QStringLiteral("leftRight"));
-+    m_ui->barOrientationCOB->addItem(tr("Right to left"), QStringLiteral("rightLeft"));
 +}
 +
 +void LXQtResourceMonitorConfiguration::loadSettings()
@@ -1223,10 +1154,10 @@ index 0000000..3e15adf
 +#endif // LXQTRESOURCEMONITORCONFIGURATION_H
 diff --git a/plugin-resourcemonitor/lxqtresourcemonitorconfiguration.ui b/plugin-resourcemonitor/lxqtresourcemonitorconfiguration.ui
 new file mode 100644
-index 0000000..13def70
+index 0000000..e9a3d02
 --- /dev/null
 +++ b/plugin-resourcemonitor/lxqtresourcemonitorconfiguration.ui
-@@ -0,0 +1,192 @@
+@@ -0,0 +1,196 @@
 +<?xml version="1.0" encoding="UTF-8"?>
 +<ui version="4.0">
 + <class>LXQtResourceMonitorConfiguration</class>
@@ -1339,12 +1270,16 @@ index 0000000..13def70
 +      <item row="2" column="0">
 +       <widget class="QLabel" name="barOrientationLabel">
 +        <property name="text">
-+         <string>Bar orientation:</string>
++         <string>Column height:</string>
 +        </property>
 +       </widget>
 +      </item>
 +      <item row="2" column="1">
-+       <widget class="QComboBox" name="barOrientationCOB"/>
++       <widget class="QComboBox" name="barOrientationCOB">
++        <property name="toolTip">
++         <string>Each horizontal pixel is one EMA sample. New samples enter on the right and older samples roll left.</string>
++        </property>
++       </widget>
 +      </item>
 +      <item row="3" column="0">
 +       <widget class="QLabel" name="widgetWidthLabel">
@@ -1549,10 +1484,10 @@ index 0000000..f270861
 +#endif // LXQTRESOURCEMONITORPLUGIN_H
 diff --git a/plugin-resourcemonitor/resourcemonitor-netcap.cpp b/plugin-resourcemonitor/resourcemonitor-netcap.cpp
 new file mode 100644
-index 0000000..4b902f3
+index 0000000..8a2534b
 --- /dev/null
 +++ b/plugin-resourcemonitor/resourcemonitor-netcap.cpp
-@@ -0,0 +1,223 @@
+@@ -0,0 +1,149 @@
 +/* BEGIN_COMMON_COPYRIGHT_HEADER
 + * (c)LGPL2+
 + *
@@ -1577,11 +1512,12 @@ index 0000000..4b902f3
 +#include <sys/syscall.h>
 +#include <unistd.h>
 +
++#include "resourcemonitorpacket.h"
++
 +#include <array>
 +#include <chrono>
 +#include <cstdint>
 +#include <cstdio>
-+#include <cstring>
 +
 +namespace
 +{
@@ -1595,50 +1531,6 @@ index 0000000..4b902f3
 +    std::uint64_t internetReceive{0};
 +    std::uint64_t internetTransmit{0};
 +};
-+
-+bool isLocalIpv4(std::uint32_t address)
-+{
-+    return (address & 0xff000000U) == 0x00000000U        // 0.0.0.0/8
-+        || (address & 0xff000000U) == 0x0a000000U        // 10.0.0.0/8
-+        || (address & 0xffc00000U) == 0x64400000U        // 100.64.0.0/10
-+        || (address & 0xff000000U) == 0x7f000000U        // 127.0.0.0/8
-+        || (address & 0xffff0000U) == 0xa9fe0000U        // 169.254.0.0/16
-+        || (address & 0xfff00000U) == 0xac100000U        // 172.16.0.0/12
-+        || (address & 0xffffff00U) == 0xc0000000U        // 192.0.0.0/24
-+        || (address & 0xffffff00U) == 0xc0000200U        // 192.0.2.0/24
-+        || (address & 0xffff0000U) == 0xc0a80000U        // 192.168.0.0/16
-+        || (address & 0xfffe0000U) == 0xc6120000U        // 198.18.0.0/15
-+        || (address & 0xffffff00U) == 0xc6336400U        // 198.51.100.0/24
-+        || (address & 0xffffff00U) == 0xcb007100U        // 203.0.113.0/24
-+        || (address & 0xf0000000U) == 0xe0000000U        // 224.0.0.0/4
-+        || (address & 0xf0000000U) == 0xf0000000U;       // 240.0.0.0/4
-+}
-+
-+bool isLocalIpv6(const in6_addr &address)
-+{
-+    if (IN6_IS_ADDR_UNSPECIFIED(&address)
-+        || IN6_IS_ADDR_LOOPBACK(&address)
-+        || IN6_IS_ADDR_LINKLOCAL(&address)
-+        || IN6_IS_ADDR_SITELOCAL(&address)
-+        || IN6_IS_ADDR_MULTICAST(&address)
-+        || (address.s6_addr[0] & 0xfeU) == 0xfcU)          // fc00::/7
-+    {
-+        return true;
-+    }
-+
-+    if (IN6_IS_ADDR_V4MAPPED(&address))
-+    {
-+        std::uint32_t ipv4Address = 0;
-+        std::memcpy(&ipv4Address, &address.s6_addr[12], sizeof(ipv4Address));
-+        return isLocalIpv4(ntohl(ipv4Address));
-+    }
-+
-+    // IPv6 documentation prefix; it is not globally routable.
-+    return address.s6_addr[0] == 0x20U
-+        && address.s6_addr[1] == 0x01U
-+        && address.s6_addr[2] == 0x0dU
-+        && address.s6_addr[3] == 0xb8U;
-+}
 +
 +bool dropCapabilities()
 +{
@@ -1654,38 +1546,6 @@ index 0000000..4b902f3
 +
 +    prctl(PR_SET_DUMPABLE, 0, 0, 0, 0);
 +    return true;
-+}
-+
-+bool classifyPacket(const std::uint8_t *packet,
-+                    std::size_t packetLength,
-+                    std::uint16_t protocol,
-+                    bool outgoing,
-+                    bool &isLocal)
-+{
-+    if (protocol == ETH_P_IP && packetLength >= 20 && (packet[0] >> 4) == 4)
-+    {
-+        const std::size_t headerLength = static_cast<std::size_t>(packet[0] & 0x0fU) * 4;
-+        if (headerLength < 20 || packetLength < headerLength)
-+            return false;
-+
-+        std::uint32_t sourceAddress = 0;
-+        std::uint32_t destinationAddress = 0;
-+        std::memcpy(&sourceAddress, packet + 12, sizeof(sourceAddress));
-+        std::memcpy(&destinationAddress, packet + 16, sizeof(destinationAddress));
-+        const std::uint32_t remoteAddress = ntohl(outgoing ? destinationAddress : sourceAddress);
-+        isLocal = isLocalIpv4(remoteAddress);
-+        return true;
-+    }
-+
-+    if (protocol == ETH_P_IPV6 && packetLength >= 40 && (packet[0] >> 4) == 6)
-+    {
-+        in6_addr remoteAddress{};
-+        std::memcpy(&remoteAddress, packet + (outgoing ? 24 : 8), sizeof(remoteAddress));
-+        isLocal = isLocalIpv6(remoteAddress);
-+        return true;
-+    }
-+
-+    return false;
 +}
 +
 +} // namespace
@@ -1736,11 +1596,12 @@ index 0000000..4b902f3
 +                && source.sll_pkttype != PACKET_LOOPBACK)
 +            {
 +                bool localDestination = false;
-+                if (classifyPacket(packetBuffer.data(),
-+                                   static_cast<std::size_t>(packetLength),
-+                                   ntohs(source.sll_protocol),
-+                                   source.sll_pkttype == PACKET_OUTGOING,
-+                                   localDestination))
++                if (ResourceMonitorPacket::classifyPacket(
++                        packetBuffer.data(),
++                        static_cast<std::size_t>(packetLength),
++                        ntohs(source.sll_protocol),
++                        source.sll_pkttype == PACKET_OUTGOING,
++                        localDestination))
 +                {
 +                    const std::uint64_t bytes = static_cast<std::uint64_t>(packetLength);
 +                    const bool outgoing = source.sll_pkttype == PACKET_OUTGOING;
@@ -1776,6 +1637,121 @@ index 0000000..4b902f3
 +        }
 +    }
 +}
+diff --git a/plugin-resourcemonitor/resourcemonitorhistory.h b/plugin-resourcemonitor/resourcemonitorhistory.h
+new file mode 100644
+index 0000000..68993ae
+--- /dev/null
++++ b/plugin-resourcemonitor/resourcemonitorhistory.h
+@@ -0,0 +1,109 @@
++/* BEGIN_COMMON_COPYRIGHT_HEADER
++ * (c)LGPL2+
++ *
++ * LXQt - a lightweight, Qt based, desktop toolset
++ * https://lxqt.org
++ *
++ * This program or library is free software; you can redistribute it
++ * and/or modify it under the terms of the GNU Lesser General Public License
++ * as published by the Free Software Foundation; either version 2.1 of the
++ * License, or (at your option) any later version.
++ *
++ * END_COMMON_COPYRIGHT_HEADER */
++
++#ifndef LXQTRESOURCEMONITORHISTORY_H
++#define LXQTRESOURCEMONITORHISTORY_H
++
++#include <algorithm>
++#include <array>
++#include <cmath>
++#include <cstddef>
++
++namespace ResourceMonitorHistory
++{
++// Widget width is capped at 300 px. Keep at most one 1-second EMA value per
++// possible display column so drawing never has to stretch or interpolate data.
++constexpr std::size_t ColumnCapacity = 300;
++
++// Cached one-second coefficients for a five-second EMA time constant.
++constexpr double EmaInputWeight = 0.18126924692201818;
++constexpr double EmaRetainedWeight = 0.8187307530779818;
++
++struct VisibleWindow
++{
++    std::size_t sampleStart{0};
++    std::size_t columnCount{0};
++    int firstColumn{0};
++};
++
++class RollingEma
++{
++public:
++    void reset() noexcept
++    {
++        m_samples.fill(0.0);
++        m_emaPercent = 0.0;
++        m_sampleCount = 0;
++        m_nextWriteIndex = 0;
++    }
++
++    void update(double percent, bool valid) noexcept
++    {
++        if (!valid)
++        {
++            reset();
++            return;
++        }
++
++        const double input = std::isfinite(percent)
++            ? std::clamp(percent, 0.0, 100.0)
++            : 0.0;
++        if (m_sampleCount == 0)
++            m_emaPercent = input;
++        else
++            m_emaPercent = m_emaPercent * EmaRetainedWeight + input * EmaInputWeight;
++
++        m_samples[m_nextWriteIndex] = m_emaPercent;
++        m_nextWriteIndex = (m_nextWriteIndex + 1) % ColumnCapacity;
++        m_sampleCount = std::min(m_sampleCount + 1, ColumnCapacity);
++    }
++
++    [[nodiscard]] std::size_t sampleCount() const noexcept { return m_sampleCount; }
++    [[nodiscard]] double emaPercent() const noexcept { return m_emaPercent; }
++
++    // Index zero is the oldest retained sample; the newest sample is last.
++    [[nodiscard]] double sampleAt(std::size_t chronologicalIndex) const noexcept
++    {
++        if (chronologicalIndex >= m_sampleCount)
++            return 0.0;
++
++        const std::size_t oldestIndex = m_sampleCount == ColumnCapacity
++            ? m_nextWriteIndex
++            : 0;
++        return m_samples[(oldestIndex + chronologicalIndex) % ColumnCapacity];
++    }
++
++    // Map one retained EMA sample to one pixel. Newer history stays at the
++    // right edge until the available columns fill, then advances left.
++    [[nodiscard]] VisibleWindow visibleWindow(int displayWidth) const noexcept
++    {
++        if (displayWidth <= 0 || m_sampleCount == 0)
++            return {};
++
++        const std::size_t columnCount = std::min(
++            m_sampleCount,
++            static_cast<std::size_t>(displayWidth));
++        return {m_sampleCount - columnCount,
++                columnCount,
++                displayWidth - static_cast<int>(columnCount)};
++    }
++
++private:
++    std::array<double, ColumnCapacity> m_samples{};
++    double m_emaPercent{0.0};
++    std::size_t m_sampleCount{0};
++    std::size_t m_nextWriteIndex{0};
++};
++} // namespace ResourceMonitorHistory
++
++#endif // LXQTRESOURCEMONITORHISTORY_H
 diff --git a/plugin-resourcemonitor/resourcemonitormath.cpp b/plugin-resourcemonitor/resourcemonitormath.cpp
 new file mode 100644
 index 0000000..e62ac47
@@ -1897,6 +1873,131 @@ index 0000000..e40b655
 +} // namespace ResourceMonitorMath
 +
 +#endif // LXQTRESOURCEMONITORMATH_H
+diff --git a/plugin-resourcemonitor/resourcemonitorpacket.h b/plugin-resourcemonitor/resourcemonitorpacket.h
+new file mode 100644
+index 0000000..7365bc8
+--- /dev/null
++++ b/plugin-resourcemonitor/resourcemonitorpacket.h
+@@ -0,0 +1,107 @@
++/* BEGIN_COMMON_COPYRIGHT_HEADER
++ * (c)LGPL2+
++ *
++ * LXQt - a lightweight, Qt based, desktop toolset
++ * https://lxqt.org
++ *
++ * This program or library is free software; you can redistribute it
++ * and/or modify it under the terms of the GNU Lesser General Public License
++ * as published by the Free Software Foundation; either version 2.1 of the
++ * License, or (at your option) any later version.
++ *
++ * END_COMMON_COPYRIGHT_HEADER */
++
++#ifndef LXQTRESOURCEMONITORPACKET_H
++#define LXQTRESOURCEMONITORPACKET_H
++
++#include <arpa/inet.h>
++#include <linux/if_ether.h>
++#include <netinet/in.h>
++
++#include <cstddef>
++#include <cstdint>
++#include <cstring>
++
++namespace ResourceMonitorPacket
++{
++[[nodiscard]] inline bool isLocalIpv4(std::uint32_t address) noexcept
++{
++    return (address & 0xff000000U) == 0x00000000U        // 0.0.0.0/8
++        || (address & 0xff000000U) == 0x0a000000U        // 10.0.0.0/8
++        || (address & 0xffc00000U) == 0x64400000U        // 100.64.0.0/10
++        || (address & 0xff000000U) == 0x7f000000U        // 127.0.0.0/8
++        || (address & 0xffff0000U) == 0xa9fe0000U        // 169.254.0.0/16
++        || (address & 0xfff00000U) == 0xac100000U        // 172.16.0.0/12
++        || (address & 0xffffff00U) == 0xc0000000U        // 192.0.0.0/24
++        || (address & 0xffffff00U) == 0xc0000200U        // 192.0.2.0/24
++        || (address & 0xffff0000U) == 0xc0a80000U        // 192.168.0.0/16
++        || (address & 0xfffe0000U) == 0xc6120000U        // 198.18.0.0/15
++        || (address & 0xffffff00U) == 0xc6336400U        // 198.51.100.0/24
++        || (address & 0xffffff00U) == 0xcb007100U        // 203.0.113.0/24
++        || (address & 0xf0000000U) == 0xe0000000U        // 224.0.0.0/4
++        || (address & 0xf0000000U) == 0xf0000000U;       // 240.0.0.0/4
++}
++
++[[nodiscard]] inline bool isLocalIpv6(const in6_addr &address) noexcept
++{
++    if (IN6_IS_ADDR_UNSPECIFIED(&address)
++        || IN6_IS_ADDR_LOOPBACK(&address)
++        || IN6_IS_ADDR_LINKLOCAL(&address)
++        || IN6_IS_ADDR_SITELOCAL(&address)
++        || IN6_IS_ADDR_MULTICAST(&address)
++        || (address.s6_addr[0] & 0xfeU) == 0xfcU)          // fc00::/7
++    {
++        return true;
++    }
++
++    if (IN6_IS_ADDR_V4MAPPED(&address))
++    {
++        std::uint32_t ipv4Address = 0;
++        std::memcpy(&ipv4Address, &address.s6_addr[12], sizeof(ipv4Address));
++        return isLocalIpv4(ntohl(ipv4Address));
++    }
++
++    // IPv6 documentation prefix; it is not globally routable.
++    return address.s6_addr[0] == 0x20U
++        && address.s6_addr[1] == 0x01U
++        && address.s6_addr[2] == 0x0dU
++        && address.s6_addr[3] == 0xb8U;
++}
++
++[[nodiscard]] inline bool classifyPacket(const std::uint8_t *packet,
++                                         std::size_t packetLength,
++                                         std::uint16_t protocol,
++                                         bool outgoing,
++                                         bool &isLocal) noexcept
++{
++    if (packet == nullptr)
++        return false;
++
++    if (protocol == ETH_P_IP && packetLength >= 20 && (packet[0] >> 4) == 4)
++    {
++        const std::size_t headerLength = static_cast<std::size_t>(packet[0] & 0x0fU) * 4;
++        if (headerLength < 20 || packetLength < headerLength)
++            return false;
++
++        std::uint32_t sourceAddress = 0;
++        std::uint32_t destinationAddress = 0;
++        std::memcpy(&sourceAddress, packet + 12, sizeof(sourceAddress));
++        std::memcpy(&destinationAddress, packet + 16, sizeof(destinationAddress));
++        const std::uint32_t remoteAddress = ntohl(outgoing ? destinationAddress : sourceAddress);
++        isLocal = isLocalIpv4(remoteAddress);
++        return true;
++    }
++
++    if (protocol == ETH_P_IPV6 && packetLength >= 40 && (packet[0] >> 4) == 6)
++    {
++        in6_addr remoteAddress{};
++        std::memcpy(&remoteAddress, packet + (outgoing ? 24 : 8), sizeof(remoteAddress));
++        isLocal = isLocalIpv6(remoteAddress);
++        return true;
++    }
++
++    return false;
++}
++} // namespace ResourceMonitorPacket
++
++#endif // LXQTRESOURCEMONITORPACKET_H
+diff --git a/plugin-resourcemonitor/resources/resourcemonitor.desktop b/plugin-resourcemonitor/resources/resourcemonitor.desktop
+new file mode 100644
+index 0000000..7edb0f0
+--- /dev/null
++++ b/plugin-resourcemonitor/resources/resourcemonitor.desktop
+@@ -0,0 +1,6 @@
++[Desktop Entry]
++Type=Service
++ServiceTypes=LXQtPanel/Plugin
++Icon=utilities-system-monitor
++Name=Resource Monitor
++Comment=Displays CPU, RAM and swap usage
 diff --git a/plugin-resourcemonitor/resources/resourcemonitor.desktop.in b/plugin-resourcemonitor/resources/resourcemonitor.desktop.in
 new file mode 100644
 index 0000000..45cf5a4

@@ -270,17 +270,6 @@ restart_panel()
         return 0
     fi
 
-    if [ "$force_restart" -eq 0 ]; then
-        printf 'Restart LXQt Panel now to refresh its cached widget list? The taskbar may disappear briefly. [Y/n] '
-        IFS= read -r answer || answer=
-        case "$answer" in
-            n|N|no|NO|No)
-                echo "Panel restart skipped. Sign out and back in, or rerun this script, before opening Panel Settings."
-                return 0
-                ;;
-        esac
-    fi
-
     command -v pgrep >/dev/null 2>&1 || {
         echo "Cannot safely locate the current panel process (pgrep is unavailable). Sign out and back in to refresh it."
         return 0

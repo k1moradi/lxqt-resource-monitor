@@ -46,7 +46,13 @@ Then build and package the plugin with one command:
 ./packaging/build.sh
 ```
 
-The packages are written to `build/packages/`; intermediate build files are in `build/lxqt-panel-2.3.2-resource-monitor/`. On x86-64, the plugin and helper are compiled for the x86-64 baseline with SSSE3 enabled and SSE4.1, SSE4.2, and AVX disabled. A newer build host therefore cannot silently produce binaries that require those newer instructions. Other architectures use their toolchain's default target.
+The packages are written to `build/packages/`; intermediate build files are in `build/lxqt-panel-2.3.2-resource-monitor/`. By default, the plugin and helper use the compiler toolchain's normal target settings, without adding flags that disable SSE4.1, SSE4.2, or AVX. On x86-64, you can build specifically for the CPU doing the build by setting the CMake option `RESOURCEMONITOR_NATIVE_OPTIMIZATIONS=ON`. The compiler then uses the instruction sets supported by that CPU. Use this only when the installed machine has a compatible CPU; omit it for packages intended for a range of machines. Other architectures keep their toolchain's normal target settings.
+
+To pass that option through the package build script:
+
+```bash
+RESOURCEMONITOR_NATIVE_OPTIMIZATIONS=ON ./packaging/build.sh
+```
 
 ## Build a binary Debian package
 

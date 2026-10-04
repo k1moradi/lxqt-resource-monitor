@@ -50,20 +50,20 @@ add_executable(resourcemonitor-netcap resourcemonitor-netcap.cpp)
 target_compile_features(resourcemonitor-netcap PRIVATE cxx_std_17)
 target_compile_options(resourcemonitor-netcap PRIVATE -Wall -Wextra -Wpedantic)
 
-# Keep x86-64 builds usable on older processors: permit SSSE3, but do not let
-# a build host with a newer CPU introduce SSE4.1, AVX, or later instructions.
+option(RESOURCEMONITOR_NATIVE_OPTIMIZATIONS
+    "Optimize for the CPU that is building the resource monitor"
+    OFF
+)
+
+# Leave the default instruction set to the compiler and toolchain. For builds
+# intended only for this machine, -march=native lets the compiler use the
+# instruction sets reported by the build CPU without requesting unsupported
+# ones.
 if(CMAKE_CXX_COMPILER_ID MATCHES "GNU|Clang"
-   AND CMAKE_SYSTEM_PROCESSOR MATCHES "^(x86_64|AMD64|amd64)$")
-    set(RESOURCEMONITOR_X86_FLAGS
-        -march=x86-64
-        -mtune=generic
-        -mssse3
-        -mno-sse4.1
-        -mno-sse4.2
-        -mno-avx
-    )
-    target_compile_options(resourcemonitor PRIVATE ${RESOURCEMONITOR_X86_FLAGS})
-    target_compile_options(resourcemonitor-netcap PRIVATE ${RESOURCEMONITOR_X86_FLAGS})
+   AND CMAKE_SYSTEM_PROCESSOR MATCHES "^(x86_64|AMD64|amd64)$"
+   AND RESOURCEMONITOR_NATIVE_OPTIMIZATIONS)
+    target_compile_options(resourcemonitor PRIVATE -march=native -mtune=native)
+    target_compile_options(resourcemonitor-netcap PRIVATE -march=native -mtune=native)
 endif()
 
 install(TARGETS resourcemonitor-netcap RUNTIME DESTINATION bin)

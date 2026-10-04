@@ -15,6 +15,7 @@ panel_source=${1:-"$project_dir/build/lxqt-panel-2.3.2"}
 package_version=${2:-1.0.8-1}
 build_dir="$project_dir/build/lxqt-panel-2.3.2-resource-monitor"
 plugin_build_dir="$build_dir/plugin-resourcemonitor"
+native_optimizations=${RESOURCEMONITOR_NATIVE_OPTIMIZATIONS:-OFF}
 dpkg --validate-version "$package_version"
 
 if ! git -C "$panel_source" rev-parse --is-inside-work-tree >/dev/null 2>&1; then
@@ -36,7 +37,8 @@ cp -a "$project_dir/plugin-resourcemonitor/." "$panel_source/plugin-resourcemoni
 
 cmake -S "$project_dir/packaging/standalone" -B "$build_dir" -G Ninja \
     -DCMAKE_BUILD_TYPE=Release \
-    -DLXQT_PANEL_SOURCE_DIR="$panel_source"
+    -DLXQT_PANEL_SOURCE_DIR="$panel_source" \
+    -DRESOURCEMONITOR_NATIVE_OPTIMIZATIONS="$native_optimizations"
 cmake --build "$build_dir" --target resourcemonitor resourcemonitor-netcap \
     --parallel "${BUILD_JOBS:-2}"
 "$project_dir/packaging/build-deb.sh" \

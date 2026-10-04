@@ -4,12 +4,13 @@ set -eu
 usage()
 {
     cat <<'EOF'
-Usage: ./packaging/deploy.sh [--dry-run] [--with-netcap] [--no-restart] [PLUGIN_DEB [NETCAP_DEB]]
+Usage: ./packaging/deploy.sh [--dry-run] [--with-netcap] [--no-restart|--restart-panel] [PLUGIN_DEB [NETCAP_DEB]]
 
 With no package path, installs the newest package for this computer from
 build/packages/. Use --dry-run to validate the package without installing it.
 Pass a second .deb or use --with-netcap to install the optional Local net and
-Internet traffic helper too.
+Internet traffic helper too. --restart-panel restarts the current user's
+graphical LXQt Panel without prompting, including when called over SSH.
 
 Run this as your logged-in desktop user, without sudo. The script uses sudo
 only for APT and can restart your LXQt Panel so it rescans the installed plugin.
@@ -24,6 +25,7 @@ fail()
 
 with_netcap=0
 no_restart=0
+force_restart=0
 dry_run=0
 while [ "$#" -gt 0 ]; do
     case "$1" in
@@ -37,6 +39,12 @@ while [ "$#" -gt 0 ]; do
             ;;
         --no-restart)
             no_restart=1
+            force_restart=0
+            shift
+            ;;
+        --restart-panel)
+            no_restart=0
+            force_restart=1
             shift
             ;;
         --dry-run)
@@ -142,12 +150,15 @@ if [ -n "$installed_monitor_version" ] \
     fail "Version $installed_monitor_version is already installed, newer than the package $plugin_version. Rebuild the current source before deploying."
 fi
 
-stage_dir=$(mktemp -d)
+stage_dir=$(mktemp -d /tmp/lxqt-resource-monitor-deploy.XXXXXX)
+chmod 755 "$stage_dir"
 trap 'rm -rf "$stage_dir"' 0
 trap 'exit 1' HUP INT TERM
-dpkg-deb -x "$plugin_deb" "$stage_dir"
-staged_library="$stage_dir/usr/lib/$multiarch/lxqt-panel/libresourcemonitor.so"
-staged_desktop="$stage_dir/usr/share/lxqt/lxqt-panel/resourcemonitor.desktop"
+extracted_dir="$stage_dir/extracted"
+mkdir -m 755 "$extracted_dir"
+dpkg-deb -x "$plugin_deb" "$extracted_dir"
+staged_library="$extracted_dir/usr/lib/$multiarch/lxqt-panel/libresourcemonitor.so"
+staged_desktop="$extracted_dir/usr/share/lxqt/lxqt-panel/resourcemonitor.desktop"
 [ -r "$staged_library" ] || fail "The package does not contain its plugin library in the LXQt Panel plugin directory for $multiarch."
 [ -r "$staged_desktop" ] || fail "The package does not contain the LXQt Panel plugin descriptor."
 grep -Fqx 'ServiceTypes=LXQtPanel/Plugin' "$staged_desktop" \
@@ -158,8 +169,8 @@ if grep -Eq '^(Hidden|NoDisplay)=true$' "$staged_desktop"; then
     fail "The packaged descriptor marks Resource Monitor hidden. Rebuild the package from this repository."
 fi
 if [ -n "$netcap_deb" ]; then
-    dpkg-deb -x "$netcap_deb" "$stage_dir"
-    [ -x "$stage_dir/usr/bin/resourcemonitor-netcap" ] \
+    dpkg-deb -x "$netcap_deb" "$extracted_dir"
+    [ -x "$extracted_dir/usr/bin/resourcemonitor-netcap" ] \
         || fail "The network helper package does not contain /usr/bin/resourcemonitor-netcap."
 fi
 
@@ -177,9 +188,19 @@ if [ "$dry_run" -eq 1 ]; then
 fi
 
 echo "APT will reinstall the package, repair missing package files, and install any declared dependencies."
+apt_package_dir="$stage_dir/apt"
+mkdir -m 755 "$apt_package_dir"
+apt_plugin_deb="$apt_package_dir/$(basename -- "$plugin_deb")"
+cp "$plugin_deb" "$apt_plugin_deb"
+chmod 644 "$apt_plugin_deb"
+if [ -n "$netcap_deb" ]; then
+    apt_netcap_deb="$apt_package_dir/$(basename -- "$netcap_deb")"
+    cp "$netcap_deb" "$apt_netcap_deb"
+    chmod 644 "$apt_netcap_deb"
+fi
 
-set -- apt-get install --reinstall "$plugin_deb"
-[ -z "$netcap_deb" ] || set -- "$@" "$netcap_deb"
+set -- apt-get install --reinstall "$apt_plugin_deb"
+[ -z "$netcap_deb" ] || set -- "$@" "$apt_netcap_deb"
 command -v sudo >/dev/null 2>&1 || fail "sudo is required to install packages."
 sudo "$@" || fail "APT could not install the packages. If repository indexes are stale, run 'sudo apt update' and try again."
 
@@ -238,108 +259,220 @@ fi
 
 restart_panel()
 {
+    panel_refreshed=0
     [ "$no_restart" -eq 0 ] || {
         echo "Panel restart skipped (--no-restart). Sign out and back in to refresh LXQt Panel's plugin list."
         return 0
     }
 
-    if [ ! -t 0 ]; then
-        echo "No interactive terminal: panel restart skipped. Sign out and back in to refresh the plugin list."
+    if [ "$force_restart" -eq 0 ] && [ ! -t 0 ]; then
+        echo "No interactive terminal: panel restart skipped. Rerun with --restart-panel to refresh the active session over SSH."
         return 0
     fi
 
-    printf 'Restart LXQt Panel now to refresh its cached widget list? The taskbar may disappear briefly. [Y/n] '
-    IFS= read -r answer || answer=
-    case "$answer" in
-        n|N|no|NO|No)
-            echo "Panel restart skipped. Sign out and back in, or rerun this script, before opening Panel Settings."
-            return 0
-            ;;
-    esac
+    if [ "$force_restart" -eq 0 ]; then
+        printf 'Restart LXQt Panel now to refresh its cached widget list? The taskbar may disappear briefly. [Y/n] '
+        IFS= read -r answer || answer=
+        case "$answer" in
+            n|N|no|NO|No)
+                echo "Panel restart skipped. Sign out and back in, or rerun this script, before opening Panel Settings."
+                return 0
+                ;;
+        esac
+    fi
 
     command -v pgrep >/dev/null 2>&1 || {
         echo "Cannot safely locate the current panel process (pgrep is unavailable). Sign out and back in to refresh it."
         return 0
     }
-    [ -n "${DISPLAY:-}${WAYLAND_DISPLAY:-}" ] || {
-        echo "No graphical-session display was detected. Sign out and back in to refresh LXQt Panel."
+    command -v xargs >/dev/null 2>&1 && command -v nohup >/dev/null 2>&1 \
+        && command -v env >/dev/null 2>&1 || {
+        echo "Required process tools (xargs, nohup, or env) are unavailable. Sign out and back in to refresh LXQt Panel."
         return 0
     }
 
-    current_session_panel_pids()
+    graphical_panel_pids()
     {
         for pid in $(pgrep -u "$(id -u)" -x lxqt-panel 2>/dev/null || true); do
             proc_env="/proc/$pid/environ"
             [ -r "$proc_env" ] || continue
-            matches_display=0
-            if [ -n "${DISPLAY:-}" ] \
-               && tr '\000' '\n' < "$proc_env" 2>/dev/null | grep -Fqx "DISPLAY=$DISPLAY"; then
-                matches_display=1
+            if tr '\000' '\n' < "$proc_env" 2>/dev/null \
+                | grep -Eq '^(DISPLAY|WAYLAND_DISPLAY)=.+'; then
+                printf '%s\n' "$pid"
             fi
-            if [ -n "${WAYLAND_DISPLAY:-}" ] \
-               && tr '\000' '\n' < "$proc_env" 2>/dev/null | grep -Fqx "WAYLAND_DISPLAY=$WAYLAND_DISPLAY"; then
-                matches_display=1
-            fi
-            [ "$matches_display" -eq 1 ] && printf '%s\n' "$pid"
         done
         return 0
     }
 
-    original_pids=$(current_session_panel_pids)
-    [ -n "$original_pids" ] || {
-        echo "No LXQt Panel process for this graphical session was found. Sign out and back in to refresh it."
+    panel_matches_display()
+    {
+        candidate_pid=$1
+        expected_display=$2
+        expected_wayland=$3
+        [ -r "/proc/$candidate_pid/environ" ] || return 1
+        if [ -n "$expected_display" ] \
+           && ! tr '\000' '\n' < "/proc/$candidate_pid/environ" 2>/dev/null \
+                | grep -Fqx "DISPLAY=$expected_display"; then
+            return 1
+        fi
+        if [ -n "$expected_wayland" ] \
+           && ! tr '\000' '\n' < "/proc/$candidate_pid/environ" 2>/dev/null \
+                | grep -Fqx "WAYLAND_DISPLAY=$expected_wayland"; then
+            return 1
+        fi
+        [ -n "$expected_display$expected_wayland" ]
+    }
+
+    graphical_pids=$(graphical_panel_pids)
+    [ -n "$graphical_pids" ] || {
+        echo "No graphical LXQt Panel process was found for your user. The package is installed; the widget will load at your next LXQt login."
         return 0
     }
 
+    selected_pid=
+    if [ -n "${LXQT_PANEL_PID:-}" ]; then
+        case "$LXQT_PANEL_PID" in
+            *[!0-9]*|'')
+                echo "LXQT_PANEL_PID must be a numeric PID belonging to your graphical LXQt Panel."
+                return 0
+                ;;
+        esac
+        for pid in $graphical_pids; do
+            [ "$pid" = "$LXQT_PANEL_PID" ] && selected_pid=$pid
+        done
+        [ -n "$selected_pid" ] || {
+            echo "LXQT_PANEL_PID=$LXQT_PANEL_PID is not a graphical LXQt Panel process owned by your user."
+            return 0
+        }
+    else
+        display_matches=
+        if [ -n "${DISPLAY:-}${WAYLAND_DISPLAY:-}" ]; then
+            for pid in $graphical_pids; do
+                if panel_matches_display "$pid" "${DISPLAY:-}" "${WAYLAND_DISPLAY:-}"; then
+                    display_matches="$display_matches $pid"
+                fi
+            done
+        fi
+        set -- $display_matches
+        if [ "$#" -eq 1 ]; then
+            selected_pid=$1
+        else
+            set -- $graphical_pids
+            if [ "$#" -eq 1 ]; then
+                selected_pid=$1
+            else
+                echo "Found multiple graphical LXQt Panel processes for your user; I did not restart an ambiguous session."
+                for pid in $graphical_pids; do
+                    panel_display=$(tr '\000' '\n' < "/proc/$pid/environ" 2>/dev/null \
+                        | sed -n 's/^DISPLAY=//p' | head -n 1)
+                    panel_wayland=$(tr '\000' '\n' < "/proc/$pid/environ" 2>/dev/null \
+                        | sed -n 's/^WAYLAND_DISPLAY=//p' | head -n 1)
+                    echo "  PID $pid (DISPLAY=${panel_display:-unset}, WAYLAND_DISPLAY=${panel_wayland:-unset})"
+                done
+                echo "Rerun with LXQT_PANEL_PID=<pid> ./packaging/deploy.sh --restart-panel to select the intended session."
+                return 0
+            fi
+        fi
+    fi
+
+    panel_env_file="$stage_dir/lxqt-panel.$selected_pid.environ"
+    cat "/proc/$selected_pid/environ" > "$panel_env_file" 2>/dev/null || {
+        echo "Could not read the selected panel's session environment. Sign out and back in to refresh it."
+        return 0
+    }
+    chmod 600 "$panel_env_file"
+    target_display=$(tr '\000' '\n' < "$panel_env_file" | sed -n 's/^DISPLAY=//p' | head -n 1)
+    target_wayland=$(tr '\000' '\n' < "$panel_env_file" | sed -n 's/^WAYLAND_DISPLAY=//p' | head -n 1)
     panel_command=$(command -v lxqt-panel 2>/dev/null || true)
     [ -n "$panel_command" ] || {
         echo "lxqt-panel was not found in PATH, so I left the running panel untouched. Sign out and back in to refresh it."
         return 0
     }
 
-    for pid in $original_pids; do
-        kill -TERM "$pid" 2>/dev/null || true
-    done
+    if [ "$force_restart" -eq 0 ]; then
+        printf 'Restart LXQt Panel now to refresh its cached widget list? The taskbar may disappear briefly. [Y/n] '
+        IFS= read -r answer || answer=
+        case "$answer" in
+            n|N|no|NO|No)
+                echo "Panel restart skipped. Sign out and back in, or rerun this script, before opening Panel Settings."
+                return 0
+                ;;
+        esac
+    fi
 
+    kill -TERM "$selected_pid" 2>/dev/null || true
     attempt=0
+    replacement_pid=
     while [ "$attempt" -lt 10 ]; do
-        current_pids=$(current_session_panel_pids)
-        if [ -z "$current_pids" ]; then
-            break
-        fi
-        for pid in $current_pids; do
-            case " $original_pids " in
-                *" $pid "*) ;;
-                *) echo "LXQt's session manager restarted the panel."; return 0 ;;
-            esac
+        for pid in $(graphical_panel_pids); do
+            if [ "$pid" != "$selected_pid" ] \
+               && panel_matches_display "$pid" "$target_display" "$target_wayland"; then
+                replacement_pid=$pid
+                break
+            fi
         done
+        [ -n "$replacement_pid" ] && break
+        kill -0 "$selected_pid" 2>/dev/null || break
         sleep 1
         attempt=$((attempt + 1))
     done
 
-    current_pids=$(current_session_panel_pids)
-    [ -z "$current_pids" ] || {
+    if [ -n "$replacement_pid" ]; then
+        panel_refreshed=1
+        echo "LXQt's session manager restarted the selected panel (PID $replacement_pid)."
+        return 0
+    fi
+    if kill -0 "$selected_pid" 2>/dev/null; then
         echo "The current panel did not stop cleanly; I did not start a second copy. Sign out and back in to refresh it."
         return 0
-    }
+    fi
 
     log_dir=${XDG_CACHE_HOME:-"${HOME:-}/.cache"}
     mkdir -p "$log_dir"
     panel_log="$log_dir/lxqt-resource-monitor-panel-restart.log"
-    nohup "$panel_command" </dev/null >>"$panel_log" 2>&1 &
-    new_panel_pid=$!
-    sleep 2
-    if kill -0 "$new_panel_pid" 2>/dev/null; then
-        echo "LXQt Panel restarted. Log: $panel_log"
+    marker_file="$stage_dir/panel-env-loaded"
+    nohup /usr/bin/xargs -0 -x -a "$panel_env_file" /bin/sh -c \
+        'panel=$1; env_file=$2; marker=$3; shift 3; : > "$marker"; rm -f "$env_file"; exec /usr/bin/env -i "$@" "$panel"' \
+        sh "$panel_command" "$panel_env_file" "$marker_file" \
+        </dev/null >>"$panel_log" 2>&1 &
+    attempt=0
+    while [ ! -f "$marker_file" ] && [ "$attempt" -lt 5 ]; do
+        sleep 1
+        attempt=$((attempt + 1))
+    done
+    if [ ! -f "$marker_file" ]; then
+        echo "Could not relaunch LXQt Panel from the saved session environment. Check $panel_log or sign out and back in." >&2
+        return 0
+    fi
+    attempt=0
+    replacement_pid=
+    while [ "$attempt" -lt 5 ]; do
+        for pid in $(graphical_panel_pids); do
+            if panel_matches_display "$pid" "$target_display" "$target_wayland"; then
+                replacement_pid=$pid
+                break
+            fi
+        done
+        [ -n "$replacement_pid" ] && break
+        sleep 1
+        attempt=$((attempt + 1))
+    done
+    if [ -n "$replacement_pid" ]; then
+        panel_refreshed=1
+        echo "LXQt Panel restarted (PID $replacement_pid). Log: $panel_log"
     else
-        echo "LXQt Panel did not stay running. Check $panel_log or sign out and back in." >&2
+        echo "LXQt Panel did not appear to stay running. Check $panel_log or sign out and back in." >&2
     fi
 }
 
 restart_panel
 
 echo ""
-echo "Open Panel Settings → Widgets → Add and select Resource Monitor."
+if [ "$panel_refreshed" -eq 1 ]; then
+    echo "Open Panel Settings → Widgets → Add and select Resource Monitor."
+else
+    echo "After restarting LXQt Panel or signing out and back in, open Panel Settings → Widgets → Add and select Resource Monitor."
+fi
 if [ -n "$netcap_deb" ]; then
     echo "The optional network helper is installed and has CAP_NET_RAW for Local net and Internet meters."
 fi

@@ -64,7 +64,21 @@ After building the packages, deploy the plugin on this computer with:
 ./packaging/deploy.sh
 ```
 
-The script selects the newest package matching this computer's architecture, checks that it was built against the installed `lxqt-panel` version, installs or repairs it through APT, verifies the plugin library and LXQt registration file, checks shared-library dependencies, and offers to restart the current LXQt Panel process so its widget list is refreshed. Run it as your logged-in desktop user without `sudo`; it requests `sudo` only for APT. Restarting briefly hides the panel and taskbar.
+The script selects the newest package matching this computer's architecture, checks that it was built against the installed `lxqt-panel` version, installs or repairs it through APT, verifies the plugin library and LXQt registration file, checks shared-library dependencies, and offers to refresh the LXQt Panel widget list. Run it as your logged-in desktop user without `sudo`; it requests `sudo` only for APT. Restarting briefly hides the panel and taskbar.
+
+You can also run deployment over SSH. The script finds the graphical panel process owned by your user and restarts it with its saved desktop-session environment, even though an SSH shell normally has no `DISPLAY` variable. Use `--restart-panel` to skip the prompt, and allocate a terminal if `sudo` needs your password:
+
+```bash
+ssh -t keivan@computer 'cd ~/lxqt-resource-monitor && ./packaging/deploy.sh --restart-panel'
+```
+
+If your user has multiple graphical LXQt sessions, the script lists their panel PIDs and leaves them alone until you select one explicitly:
+
+```bash
+LXQT_PANEL_PID=1234 ./packaging/deploy.sh --restart-panel
+```
+
+If no graphical panel is running for that user, the package is still installed and the widget will be available after the next LXQt login. Use `--no-restart` to install without refreshing the current panel.
 
 To validate the package without installing it, run:
 

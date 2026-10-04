@@ -24,12 +24,17 @@
 
 #include <QDebug>
 #include <QFontMetrics>
+#include <QGuiApplication>
 #include <QHBoxLayout>
+#include <QLabel>
+#include <QMouseEvent>
 #include <QPainter>
 #include <QPalette>
+#include <QScreen>
 #include <QStandardPaths>
 #include <QStringList>
 #include <QTimerEvent>
+#include <QVBoxLayout>
 
 #include <algorithm>
 #include <cmath>
@@ -53,6 +58,7 @@ constexpr int MeterGap = 0;
 constexpr int TextHorizontalPadding = 0;
 constexpr int PreferredTextPixelSize = 10;
 constexpr int MinimumTextPixelSize = 7;
+constexpr int DetailsPopupWidth = 320;
 
 } // namespace
 
@@ -61,11 +67,34 @@ LXQtResourceMonitor::LXQtResourceMonitor(ILXQtPanelPlugin *plugin, QWidget *pare
     , m_plugin(plugin)
 {
     setObjectName(QStringLiteral("LXQtResourceMonitor"));
+    m_sizingWidget.setAttribute(Qt::WA_TransparentForMouseEvents);
 
     auto *layout = new QHBoxLayout(this);
     layout->setSpacing(0);
     layout->setContentsMargins(0, 0, 0, 0);
     layout->addWidget(&m_sizingWidget);
+
+    m_detailsPopup = new QFrame(this, Qt::Popup | Qt::FramelessWindowHint);
+    m_detailsPopup->setObjectName(QStringLiteral("LXQtResourceMonitorDetailsPopup"));
+    m_detailsPopup->setFrameShape(QFrame::StyledPanel);
+    m_detailsPopup->setFrameShadow(QFrame::Raised);
+    m_detailsPopup->setAutoFillBackground(true);
+    m_detailsPopup->setFixedWidth(DetailsPopupWidth);
+
+    auto *detailsLayout = new QVBoxLayout(m_detailsPopup);
+    detailsLayout->setContentsMargins(10, 8, 10, 8);
+    detailsLayout->setSpacing(4);
+
+    auto *detailsHeading = new QLabel(tr("Resource Monitor"), m_detailsPopup);
+    QFont headingFont = detailsHeading->font();
+    headingFont.setBold(true);
+    detailsHeading->setFont(headingFont);
+    detailsLayout->addWidget(detailsHeading);
+
+    m_detailsText = new QLabel(m_detailsPopup);
+    m_detailsText->setTextFormat(Qt::PlainText);
+    m_detailsText->setWordWrap(true);
+    detailsLayout->addWidget(m_detailsText);
 
 #ifdef STATGRAB_NEWER_THAN_0_90
     const sg_error initResult = sg_init(0);
@@ -649,7 +678,68 @@ void LXQtResourceMonitor::updateToolTip()
     if (lines.isEmpty())
         lines.emplaceBack(tr("No resources selected"));
 
-    setToolTip(lines.join(QLatin1Char('\n')));
+    const QString details = lines.join(QLatin1Char('\n'));
+    setToolTip(details);
+    m_detailsText->setText(details);
+
+    // refreshStats() runs on the independent one-second history timer, so an
+    // open popup follows the same fresh samples as the rolling graph.
+    if (m_detailsPopup->isVisible())
+        positionDetailsPopup();
+}
+
+void LXQtResourceMonitor::showDetailsPopup()
+{
+    updateToolTip();
+    positionDetailsPopup();
+    m_detailsPopup->show();
+    m_detailsPopup->raise();
+}
+
+void LXQtResourceMonitor::positionDetailsPopup()
+{
+    QScreen *screen = QGuiApplication::screenAt(mapToGlobal(rect().center()));
+    if (screen == nullptr)
+        screen = QGuiApplication::primaryScreen();
+
+    if (screen == nullptr)
+    {
+        m_detailsPopup->adjustSize();
+        m_detailsPopup->move(mapToGlobal(QPoint(0, height() + 4)));
+        return;
+    }
+
+    const QRect availableGeometry = screen->availableGeometry();
+    m_detailsPopup->setFixedWidth(std::min(DetailsPopupWidth, availableGeometry.width()));
+    m_detailsPopup->adjustSize();
+
+    const QPoint widgetTopLeft = mapToGlobal(QPoint(0, 0));
+    QPoint position = mapToGlobal(QPoint(0, height() + 4));
+    if (position.y() + m_detailsPopup->height() > availableGeometry.bottom() + 1)
+        position.setY(widgetTopLeft.y() - m_detailsPopup->height() - 4);
+
+    const int maximumX = std::max(availableGeometry.left(),
+                                  availableGeometry.right() - m_detailsPopup->width() + 1);
+    const int maximumY = std::max(availableGeometry.top(),
+                                  availableGeometry.bottom() - m_detailsPopup->height() + 1);
+    position.setX(std::clamp(position.x(), availableGeometry.left(), maximumX));
+    position.setY(std::clamp(position.y(), availableGeometry.top(), maximumY));
+    m_detailsPopup->move(position);
+}
+
+void LXQtResourceMonitor::mousePressEvent(QMouseEvent *event)
+{
+    if (event->button() == Qt::LeftButton)
+    {
+        if (m_detailsPopup->isVisible())
+            m_detailsPopup->hide();
+        else
+            showDetailsPopup();
+        event->accept();
+        return;
+    }
+
+    QFrame::mousePressEvent(event);
 }
 
 void LXQtResourceMonitor::timerEvent(QTimerEvent *event)

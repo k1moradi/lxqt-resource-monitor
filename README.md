@@ -13,6 +13,7 @@ The commands below assume you have already cloned this repository and are runnin
 - Default width is **57 px for three selected resources**, giving each bar 19 px. The widget grows or shrinks with the number of selected resources, keeping each bar the same width. The setting is configurable live from 48 to 300 px for three resources.
 - The widget update interval defaults to one second and is configurable from 0.5 seconds; EMA sampling and repainting run once per second regardless of that setting.
 - The tooltip shows percentages, used/total RAM and SWAP values, and read/write rates for enabled I/O meters.
+- Left-click the widget to open a compact details popup for the enabled resources. Its values refresh with each one-second sample while it is open.
 - Network traffic is classified by its remote IP address: private/local IP traffic appears under Local net; public IP traffic appears under Internet. The optional `resourcemonitor-netcap` helper reads IP headers only and does not save addresses or packet contents. Network sampling requires this helper to be installed as a root-owned executable with `CAP_NET_RAW`; the helper drops that capability after opening its packet socket.
 - Local net and Internet percentages are each relative to the highest combined receive and transmit rate observed by that monitor session. These are activity levels, not percentages of physical link capacity.
 - If swap is not configured, its meter is empty and the tooltip says `SWAP: not configured`.

@@ -30,6 +30,8 @@
 #include <cstddef>
 
 class ILXQtPanelPlugin;
+class QLabel;
+class QMouseEvent;
 class QPaintEvent;
 class QPainter;
 class QResizeEvent;
@@ -58,6 +60,7 @@ public:
 protected:
     void timerEvent(QTimerEvent *event) override;
     void paintEvent(QPaintEvent *event) override;
+    void mousePressEvent(QMouseEvent *event) override;
     void resizeEvent(QResizeEvent *event) override;
 
 private:
@@ -114,10 +117,14 @@ private:
                           quint64 writeBytes,
                           qint64 elapsedMilliseconds);
     void updateToolTip();
+    void showDetailsPopup();
+    void positionDetailsPopup();
     void drawMeter(QPainter &painter, Resource resource, const QRect &meterRectangle);
 
     ILXQtPanelPlugin *m_plugin;
     QWidget m_sizingWidget;
+    QFrame *m_detailsPopup{nullptr};
+    QLabel *m_detailsText{nullptr};
     std::array<ResourceSnapshot, static_cast<std::size_t>(Resource::Count)> m_resources{};
 
     bool m_showText{true};
